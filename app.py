@@ -141,4 +141,4 @@ else:
 
 # Rodapé
 st.markdown("---")
-st.markdown("Desenvolvido por Dev.Alli|Project - © 2023")
+st.markdown("Desenvolvido por Dev.Alli | Project - © 2025")
