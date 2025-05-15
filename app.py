@@ -2,11 +2,16 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import pytz
-from utils.parser import extract_payment_data
-from utils.indices import *
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent))
+try:
+    from utils.parser import extract_payment_data
+    from utils.indices import *
+except ImportError:
+    # Força o caminho absoluto para desenvolvimento local
+    import os
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.parser import extract_payment_data
+    from utils.indices import *
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
