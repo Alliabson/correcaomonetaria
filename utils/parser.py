@@ -1,7 +1,6 @@
 import pandas as pd
 import pdfplumber
 from datetime import datetime
-import extract_payment_data
 
 def extract_payment_data(uploaded_file):
     """Extrai dados de parcelas de arquivos PDF ou Excel"""
