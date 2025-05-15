@@ -91,6 +91,11 @@ def extract_from_excel(excel_file):
     # Normalizar nomes de colunas
     df.columns = [col_mapping.get(col.lower().strip(), col) for col in df.columns]
     
+    # Verificar se todas as colunas necessárias estão presentes
+    required_columns = ['Parcela', 'Dt Vencim', 'Valor Parcela', 'Dt Recebimento', 'Valor Recebido']
+    if not all(col in df.columns for col in required_columns):
+        raise ValueError("Não foi possível identificar as colunas necessárias no arquivo Excel")
+    
     # Converter tipos de dados
     date_columns = ['Dt Vencim', 'Dt Recebimento']
     for col in date_columns:
@@ -103,6 +108,4 @@ def extract_from_excel(excel_file):
             df[col] = df[col].apply(
                 lambda x: parse_currency(str(x)) if isinstance(x, str) else float(x))
     
-    return df[['Parcela', 'Dt Vencim', 'Valor Parcela', 'Dt Recebimento', 'Valor Recebido']]
-        else:
-            raise ValueError("Não foi possível identificar as colunas necessárias no arquivo Excel")
+    return df[required_columns]
