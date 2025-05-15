@@ -13,7 +13,7 @@ def extract_payment_data(file):
         raise ValueError("Formato de arquivo não suportado")
 
 def extract_from_pdf(pdf_file):
-    """Extrai dados específicos do PDF com tratamento completo para todos os formatos"""
+    """Extrai dados específicos do PDF com tratamento completo"""
     parcelas = []
     
     with pdfplumber.open(pdf_file) as pdf:
@@ -26,76 +26,47 @@ def extract_from_pdf(pdf_file):
             in_payment_table = False
             
             for line in lines:
-                # Verificação robusta do cabeçalho da tabela
-                if ("Parcela" in line and "Dt Vencim" in line and "Valor Parc." in line and 
-                    "Dt. Receb." in line and "Vlr da Parcela" in line):
+                # Verificação robusta do cabeçalho
+                if all(term in line for term in ["Parcela", "Dt Vencim", "Valor Parc.", "Dt. Receb.", "Vlr da Parcela"]):
                     in_payment_table = True
                     continue
                     
-                if in_payment_table:
-                    # Padrão completo para capturar todas as informações da linha
+                if in_payment_table and line.strip():
+                    # Padrão completo para capturar todos os dados
                     pattern = (
-                        r'^(?P<parcela>[A-Z]{1,3}\.\d+/\d+)\s+'  # Parcela (PR.1/10)
-                        r'(?P<dt_vencim>\d{2}/\d{2}/\d{4})\s+'   # Data vencimento
-                        r'(?P<dias_atraso>\d+)?\s*'              # Dias atraso (opcional)
-                        r'(?P<valor_parc>[\d.,]+)\s+'            # Valor parcela
+                        r'^(?P<parcela>[A-Z]{1,3}\.\d+/\d+)\s+'  # Parcela (E.1/1, P.1/35)
+                        r'(?P<dt_vencim>\d{2}/\d{2}/\d{4})\s+'   # Data vencimento (20/01/2024)
+                        r'(?P<valor_parc>[\d.,]+)\s+'            # Valor parcela (100.000,00)
                         r'(?P<dt_receb>\d{2}/\d{2}/\d{4})?\s*'   # Data recebimento (opcional)
                         r'(?P<valor_recebido>[\d.,]+)?\s*'       # Valor recebido (opcional)
-                        r'(?P<correcao>[\d.,]+)?\s*'             # Correção (opcional)
-                        r'(?P<multa>[\d.,]+)?\s*'                # Multa (opcional)
-                        r'(?P<juros>[\d.,]+)?\s*'                # Juros (opcional)
-                        r'(?P<desconto>[\d.,]+)?\s*'             # Desconto (opcional)
-                        r'(?P<corr_atr>[\d.,]+)?\s*'             # Correção atraso (opcional)
-                        r'(?P<outros>[\d.,]+)?'                  # Outros (opcional)
                     )
                     
                     match = re.search(pattern, line.strip())
                     if match:
                         try:
-                            # Processa os dados capturados
+                            # Processa os dados básicos
                             parcela = match.group('parcela')
+                            dt_vencim = datetime.strptime(match.group('dt_vencim'), '%d/%m/%Y').date()
+                            valor_parc = float(match.group('valor_parc').replace('.', '').replace(',', '.'))
                             
-                            dt_vencim = datetime.strptime(
-                                match.group('dt_vencim'), '%d/%m/%Y'
-                            ).date()
-                            
-                            valor_parc = float(
-                                match.group('valor_parc').replace('.', '').replace(',', '.')
-                            )
-                            
-                            # Trata dados opcionais
+                            # Processa dados de recebimento (opcionais)
                             dt_receb = None
-                            if match.group('dt_receb'):
-                                dt_receb = datetime.strptime(
-                                    match.group('dt_receb'), '%d/%m/%Y'
-                                ).date()
-                            
                             valor_recebido = 0.0
-                            if match.group('valor_recebido'):
-                                valor_recebido = float(
-                                    match.group('valor_recebido').replace('.', '').replace(',', '.')
-                                )
                             
-                            # Adiciona campos adicionais
-                            dias_atraso = int(match.group('dias_atraso')) if match.group('dias_atraso') else 0
+                            if match.group('dt_receb'):
+                                dt_receb = datetime.strptime(match.group('dt_receb'), '%d/%m/%Y').date()
+                            
+                            if match.group('valor_recebido'):
+                                valor_recebido = float(match.group('valor_recebido').replace('.', '').replace(',', '.'))
                             
                             # Adiciona à lista de parcelas
                             parcela_info = {
                                 'Parcela': parcela,
                                 'Dt Vencim': dt_vencim,
-                                'Dias Atraso': dias_atraso,
                                 'Valor Parcela': valor_parc,
                                 'Dt Recebimento': dt_receb,
                                 'Valor Recebido': valor_recebido,
                                 'Status Pagamento': 'Pago' if valor_recebido > 0 else 'Pendente',
-                                'Correcao': float(match.group('correcao').replace('.', '').replace(',', '.')) 
-                                           if match.group('correcao') else 0.0,
-                                'Multa': float(match.group('multa').replace('.', '').replace(',', '.')) 
-                                       if match.group('multa') else 0.0,
-                                'Juros': float(match.group('juros').replace('.', '').replace(',', '.')) 
-                                       if match.group('juros') else 0.0,
-                                'Desconto': float(match.group('desconto').replace('.', '').replace(',', '.')) 
-                                           if match.group('desconto') else 0.0,
                                 'Arquivo Origem': pdf_file.name
                             }
                             parcelas.append(parcela_info)
@@ -113,6 +84,12 @@ def extract_from_pdf(pdf_file):
     
     if not df.empty:
         # Calcula campos adicionais
+        df['Dias Atraso'] = df.apply(
+            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
+            if pd.notnull(x['Dt Recebimento']) and x['Dt Recebimento'] > x['Dt Vencim'] 
+            else 0,
+            axis=1
+        )
         df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
         
         # Ordena por data de vencimento
@@ -140,61 +117,53 @@ def extract_from_excel(excel_file):
     try:
         df = pd.read_excel(excel_file, engine='openpyxl')
         
-        # Mapeamento completo de colunas alternativas
+        # Mapeamento de colunas
         col_mapping = {
             'parcela': 'Parcela',
             'numero parcela': 'Parcela',
             'dt vencim': 'Dt Vencim',
             'data vencimento': 'Dt Vencim',
-            'vencimento': 'Dt Vencim',
             'valor parc': 'Valor Parcela',
-            'valor': 'Valor Parcela',
             'valor parcela': 'Valor Parcela',
             'dt receb': 'Dt Recebimento',
             'data recebimento': 'Dt Recebimento',
-            'recebimento': 'Dt Recebimento',
             'vlr parcela': 'Valor Recebido',
-            'valor recebido': 'Valor Recebido',
-            'vlr recebido': 'Valor Recebido',
-            'pagamento': 'Valor Recebido',
-            'dias atraso': 'Dias Atraso',
-            'atraso': 'Dias Atraso'
+            'valor recebido': 'Valor Recebido'
         }
         
-        # Normalizar nomes de colunas
+        # Normaliza nomes de colunas
         df.columns = [col_mapping.get(col.lower().strip(), col) for col in df.columns]
         
-        # Verificação robusta das colunas necessárias
+        # Verifica colunas obrigatórias
         required_columns = ['Parcela', 'Dt Vencim', 'Valor Parcela']
         missing_columns = [col for col in required_columns if col not in df.columns]
         
         if missing_columns:
             raise ValueError(f"Colunas obrigatórias não encontradas: {', '.join(missing_columns)}")
         
-        # Conversão de tipos com tratamento de erros
-        date_columns = ['Dt Vencim', 'Dt Recebimento']
-        for col in date_columns:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce').dt.date
+        # Conversão de tipos
+        if 'Dt Vencim' in df.columns:
+            df['Dt Vencim'] = pd.to_datetime(df['Dt Vencim'], dayfirst=True, errors='coerce').dt.date
+        if 'Dt Recebimento' in df.columns:
+            df['Dt Recebimento'] = pd.to_datetime(df['Dt Recebimento'], dayfirst=True, errors='coerce').dt.date
         
-        currency_columns = ['Valor Parcela', 'Valor Recebido']
-        for col in currency_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: parse_currency(str(x)) if pd.notna(x) else 0.0)
+        if 'Valor Parcela' in df.columns:
+            df['Valor Parcela'] = df['Valor Parcela'].apply(lambda x: parse_currency(str(x)))
+        if 'Valor Recebido' in df.columns:
+            df['Valor Recebido'] = df['Valor Recebido'].apply(lambda x: parse_currency(str(x)))
         
-        # Adiciona colunas complementares se não existirem
-        if 'Status Pagamento' not in df.columns:
-            df['Status Pagamento'] = df.apply(
-                lambda x: 'Pago' if x.get('Valor Recebido', 0) > 0 else 'Pendente', 
-                axis=1
-            )
-        
-        if 'Dias Atraso' not in df.columns:
-            df['Dias Atraso'] = 0
-        
-        if 'Valor Pendente' not in df.columns:
-            df['Valor Pendente'] = df['Valor Parcela'] - df.get('Valor Recebido', 0)
-        
+        # Adiciona colunas calculadas
+        df['Status Pagamento'] = df.apply(
+            lambda x: 'Pago' if x.get('Valor Recebido', 0) > 0 else 'Pendente', 
+            axis=1
+        )
+        df['Dias Atraso'] = df.apply(
+            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
+            if 'Dt Recebimento' in df.columns and pd.notnull(x['Dt Recebimento']) and x['Dt Recebimento'] > x['Dt Vencim'] 
+            else 0,
+            axis=1
+        )
+        df['Valor Pendente'] = df['Valor Parcela'] - df.get('Valor Recebido', 0)
         df['Arquivo Origem'] = excel_file.name
         
         return df
