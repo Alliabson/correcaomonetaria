@@ -2,8 +2,20 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import pytz
-from utils.parser import extract_payment_data
-from utils.indices import *
+import sys
+import os
+
+# Adiciona o diretório utils ao path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from utils.parser import extract_payment_data
+    from utils.indices import *
+except ImportError as e:
+    st.error(f"Erro ao importar módulos: {str(e)}")
+    st.stop()
+
+
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
