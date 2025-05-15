@@ -10,7 +10,7 @@ def extract_payment_data(uploaded_file):
         return extract_from_excel(uploaded_file)
     else:
         raise ValueError("Formato de arquivo não suportado")
-
+#Extratos de info dos PDF's
 def extract_from_pdf(pdf_file):
     """Extrai dados específicos do PDF da Aquarela da Mata"""
     parcelas = []
@@ -20,39 +20,30 @@ def extract_from_pdf(pdf_file):
             text = page.extract_text()
             lines = text.split('\n')
             
-            # Flag para identificar quando estamos na tabela de parcelas
             in_payment_table = False
             header_found = False
-            column_positions = {}
             
             for line in lines:
-                # Identificar início da tabela de parcelas
-                if "Parcela" in line and "Valor Parc." in line and "Dt. Receb." in line:
+                # Verifica se é a linha de cabeçalho da tabela
+                if ("Parcela" in line and "Dt Vencim" in line and "Valor Parc." in line and 
+                    "Dt. Receb." in line and "Vlr da Parcela" in line):
                     in_payment_table = True
                     header_found = True
-                    
-                    # Mapear posições exatas das colunas
-                    headers = line.split()
-                    column_positions = {
-                        'Parcela': headers.index("Parcela"),
-                        'Dt Vencim': headers.index("Dt"),
-                        'Valor Parc.': headers.index("Valor"),
-                        'Dt. Receb.': headers.index("Dt."),
-                        'Vlr da Parcela': headers.index("Vlr")
-                    }
                     continue
                 
+                # Processa as linhas de dados
                 if in_payment_table and line.strip().startswith('PR.'):
-                    parts = line.split()
+                    # Divide a linha em partes, considerando múltiplos espaços
+                    parts = [p for p in line.split('  ') if p.strip() != '']
                     
                     try:
-                        # Extração precisa baseada nas posições mapeadas
+                        # Extrai os dados baseado nas posições fixas (ajuste conforme necessário)
                         parcela_info = {
-                            'Parcela': parts[column_positions['Parcela']],
-                            'Dt Vencim': parse_date(parts[column_positions['Dt Vencim']]),
-                            'Valor Parcela': parse_currency(parts[column_positions['Valor Parc.']]),
-                            'Dt Recebimento': parse_date(parts[column_positions['Dt. Receb.']]),
-                            'Valor Recebido': parse_currency(parts[column_positions['Vlr da Parcela']])
+                            'Parcela': parts[0].strip(),
+                            'Dt Vencim': parse_date(parts[1].strip()),
+                            'Valor Parcela': parse_currency(parts[2].strip()),
+                            'Dt Recebimento': parse_date(parts[3].strip()),
+                            'Valor Recebido': parse_currency(parts[4].strip())
                         }
                         parcelas.append(parcela_info)
                         
@@ -60,7 +51,7 @@ def extract_from_pdf(pdf_file):
                         print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
                         continue
                 
-                # Finalizar quando encontrar a seção de totais
+                # Finaliza quando encontrar o total
                 if in_payment_table and "Total a pagar:" in line:
                     break
     
