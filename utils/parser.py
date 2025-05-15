@@ -31,19 +31,20 @@ def extract_from_pdf(pdf_file):
                     header_found = True
                     continue
                 
-                # Processa as linhas de dados
+                # Processa as linhas de dados que começam com PR.
                 if in_payment_table and line.strip().startswith('PR.'):
-                    # Divide a linha em partes, considerando múltiplos espaços
-                    parts = [p for p in line.split('  ') if p.strip() != '']
+                    # Remove múltiplos espaços e divide corretamente
+                    cleaned_line = ' '.join(line.split())
+                    parts = cleaned_line.split()
                     
                     try:
-                        # Extrai os dados baseado nas posições fixas (ajuste conforme necessário)
+                        # Ajuste os índices conforme necessário para o seu PDF
                         parcela_info = {
-                            'Parcela': parts[0].strip(),
-                            'Dt Vencim': parse_date(parts[1].strip()),
-                            'Valor Parcela': parse_currency(parts[2].strip()),
-                            'Dt Recebimento': parse_date(parts[3].strip()),
-                            'Valor Recebido': parse_currency(parts[4].strip())
+                            'Parcela': parts[0],
+                            'Dt Vencim': parse_date(parts[1]),
+                            'Valor Parcela': parse_currency(parts[3]),
+                            'Dt Recebimento': parse_date(parts[4]),
+                            'Valor Recebido': parse_currency(parts[10])
                         }
                         parcelas.append(parcela_info)
                         
@@ -54,6 +55,11 @@ def extract_from_pdf(pdf_file):
                 # Finaliza quando encontrar o total
                 if in_payment_table and "Total a pagar:" in line:
                     break
+    
+    if not parcelas:
+        print("Nenhuma parcela encontrada. Linhas disponíveis:")
+        for i, line in enumerate(lines):
+            print(f"{i}: {line}")
     
     return pd.DataFrame(parcelas)
 
