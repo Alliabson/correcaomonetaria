@@ -2,134 +2,123 @@ import pandas as pd
 import pdfplumber
 from datetime import datetime
 import re
+from typing import List, Dict
 
 def extract_payment_data(file):
-    """Função principal para extrair dados de pagamento"""
+    """Função principal para extração de dados"""
     if file.name.lower().endswith('.pdf'):
-        return extract_from_pdf_specific(file)
+        return extract_from_pdf(file)
     elif file.name.lower().endswith(('.xls', '.xlsx')):
         return extract_from_excel(file)
     else:
         raise ValueError("Formato de arquivo não suportado")
 
-def extract_from_pdf_specific(pdf_file):
-    """Extrai dados do PDF específico 15-AM005-362.pdf com abordagem direta"""
-    parcelas = []
+def extract_from_pdf(pdf_file) -> Dict:
+    """Extrai dados do PDF e retorna estrutura com tabela e metadados"""
+    result = {
+        'raw_text': '',
+        'tables': [],
+        'columns': [],
+        'parcelas': []
+    }
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # Extrai o texto mantendo a posição dos elementos
+            # Extrai texto bruto para análise
             text = page.extract_text()
-            if not text:
-                continue
-                
-            lines = text.split('\n')
-            in_payment_table = False
+            result['raw_text'] += text + "\n\n"
             
-            for line in lines:
-                # Identifica o início da tabela de pagamentos
-                if "Parcela" in line and "DI Veném" in line and "Valor Parc." in line:
-                    in_payment_table = True
-                    continue
-                
-                if in_payment_table:
-                    # Padrão específico para as parcelas deste documento
-                    if re.match(r'^(E|P)\.\d+/\d+', line.strip()):
-                        try:
-                            # Processamento especial para linhas com valores monetários
-                            parts = re.split(r'\s{2,}', line.strip())
-                            
-                            # Garante que temos pelo menos 3 colunas (Parcela, Data, Valor)
-                            if len(parts) < 3:
-                                continue
-                                
-                            parcela = parts[0]
-                            
-                            # Data de vencimento (formato DDMM/AAAA)
-                            dt_venc = parse_date_specific(parts[1])
-                            if not dt_venc:
-                                continue
-                            
-                            valor_parc = parse_currency_specific(parts[2])
-                            
-                            # Data e valor de recebimento (podem não existir)
-                            dt_receb = None
-                            valor_receb = 0.0
-                            
-                            if len(parts) > 3:
-                                dt_receb = parse_date_specific(parts[3])
-                                if len(parts) > 4:
-                                    valor_receb = parse_currency_specific(parts[4])
-                            
-                            # Adiciona à lista de parcelas
-                            parcelas.append({
-                                'Parcela': parcela,
-                                'Dt Vencim': dt_venc,
-                                'Valor Parcela': valor_parc,
-                                'Dt Recebimento': dt_receb,
-                                'Valor Recebido': valor_receb,
-                                'Status Pagamento': 'Pago' if valor_receb > 0 else 'Pendente',
-                                'Arquivo Origem': pdf_file.name
-                            })
-                            
-                        except Exception as e:
-                            print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
-                            continue
+            # Extrai tabelas usando algoritmo otimizado
+            tables = page.extract_tables({
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "intersection_y_tolerance": 10
+            })
+            
+            for table in tables:
+                if len(table) > 1:  # Ignora tabelas vazias
+                    result['tables'].append(table)
                     
-                    # Finaliza quando encontrar o total
-                    if "Total a pagar:" in line:
-                        break
+                    # Identifica cabeçalhos
+                    if any("Parcela" in str(cell) for cell in table[0]):
+                        headers = [str(cell).strip() for cell in table[0]]
+                        result['columns'] = headers
+                        
+                        # Processa linhas de dados
+                        for row in table[1:]:
+                            if len(row) >= len(headers):
+                                parcela = {
+                                    'raw_data': row,
+                                    'processed': False
+                                }
+                                for i, header in enumerate(headers):
+                                    parcela[header] = row[i] if i < len(row) else None
+                                result['parcelas'].append(parcela)
     
-    # Cria DataFrame com tratamento seguro
-    df = pd.DataFrame(parcelas)
-    
-    if not df.empty:
-        # Calcula dias de atraso apenas para parcelas pagas
-        df['Dias Atraso'] = df.apply(
-            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
-            if pd.notna(x['Dt Recebimento']) else 0,
-            axis=1
-        )
-        
-        df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
-    
-    return df
+    return result
 
-def parse_date_specific(date_str):
-    """Converte datas no formato específico do PDF (DDMM/AAAA)"""
+def process_extracted_data(raw_data: Dict, config: Dict) -> pd.DataFrame:
+    """Processa os dados extraídos conforme configuração"""
+    parcelas = []
+    
+    for parcela in raw_data['parcelas']:
+        try:
+            processed = {
+                'Parcela': parcela.get(config.get('col_parcela', 'Parcela'), ''),
+                'Dt Vencim': parse_date(parcela.get(config.get('col_dt_vencim', 'DI Veném Atraso'), '')),
+                'Valor Parcela': parse_currency(parcela.get(config.get('col_valor_parc', 'Valor Parc.'), '0')),
+                'Dt Recebimento': parse_date(parcela.get(config.get('col_dt_receb', 'Di. Receb.'), '')),
+                'Valor Recebido': parse_currency(parcela.get(config.get('col_valor_receb', 'Vir da Parcela'), '0')),
+                'Arquivo Origem': 'PDF'
+            }
+            
+            processed['Status Pagamento'] = 'Pago' if processed['Valor Recebido'] > 0 else 'Pendente'
+            processed['Dias Atraso'] = (processed['Dt Recebimento'] - processed['Dt Vencim']).days if processed['Dt Recebimento'] else 0
+            processed['Valor Pendente'] = processed['Valor Parcela'] - processed['Valor Recebido']
+            
+            parcelas.append(processed)
+            
+        except Exception as e:
+            print(f"Erro ao processar parcela: {parcela}. Erro: {str(e)}")
+            continue
+    
+    return pd.DataFrame(parcelas)
+
+def parse_date(date_str):
+    """Converte string de data para objeto date"""
     try:
         date_str = str(date_str).strip()
         if not date_str or date_str.lower() == 'nan':
             return None
         
-        # Remove possíveis barras extras
-        date_str = date_str.replace('/', '')
-        
-        # Formato DDMMAAAA
-        if len(date_str) == 8 and date_str.isdigit():
-            day = int(date_str[:2])
-            month = int(date_str[2:4])
-            year = int(date_str[4:8])
-            return datetime(year, month, day).date()
-        
+        # Tenta vários formatos de data
+        for fmt in ['%d%m/%Y', '%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d']:
+            try:
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
         return None
     except:
         return None
 
-def parse_currency_specific(value_str):
-    """Converte valores monetários no formato específico do PDF"""
+def parse_currency(value_str):
+    """Converte valores monetários para float"""
     try:
         value_str = str(value_str).strip()
         if not value_str or value_str.lower() == 'nan':
             return 0.0
             
-        # Remove todos os pontos (separadores de milhar)
-        value_str = value_str.replace('.', '')
+        # Remove caracteres não numéricos exceto vírgula e ponto
+        cleaned = re.sub(r'[^\d,.-]', '', value_str)
         
-        # Substitui vírgula decimal por ponto
-        value_str = value_str.replace(',', '.')
+        # Caso tenha tanto ponto quanto vírgula (1.234,56)
+        if '.' in cleaned and ',' in cleaned:
+            cleaned = cleaned.replace('.', '').replace(',', '.')
+        # Caso tenha apenas vírgula (1234,56)
+        elif ',' in cleaned:
+            cleaned = cleaned.replace(',', '.')
         
-        return float(value_str)
+        return float(cleaned)
     except:
         return 0.0
 
