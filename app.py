@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import pytz
-from .parser import extract_payment_data  # Usa . para indicar importação relativa
-from .indices import *
+from utils.parser import extract_payment_data
+from utils.indices import *
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
