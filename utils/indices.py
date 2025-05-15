@@ -1,7 +1,8 @@
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date
 import streamlit as st
+from functools import lru_cache
 
 # Códigos das séries no BCB (SGS)
 CODIGOS_INDICES = {
@@ -11,25 +12,29 @@ CODIGOS_INDICES = {
     "INCC": 192
 }
 
-def fetch_bcb_data(series_code, start_date, end_date):
-    """Busca dados do Banco Central"""
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_code}/dados"
-    params = {
-        "formato": "json",
-        "dataInicial": start_date.strftime("%d/%m/%Y"),
-        "dataFinal": end_date.strftime("%d/%m/%Y")
-    }
-    
+@lru_cache(maxsize=32)
+def fetch_bcb_data(series_code, start_date: date, end_date: date):
+    """Busca dados do Banco Central com tratamento de datas"""
     try:
+        url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_code}/dados"
+        params = {
+            "formato": "json",
+            "dataInicial": start_date.strftime("%d/%m/%Y"),
+            "dataFinal": end_date.strftime("%d/%m/%Y")
+        }
+        
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         
+        if not data:
+            raise ValueError("Nenhum dado retornado pela API")
+        
         # Converter para DataFrame e processar
         df = pd.DataFrame(data)
-        df['data'] = pd.to_datetime(df['data'], dayfirst=True)
-        df['valor'] = pd.to_numeric(df['valor'])
-        df.set_index('data', inplace=True)
+        df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
+        df['valor'] = pd.to_numeric(df['valor']) / 100  # Converter porcentagem para decimal
+        df = df[(df['data'] >= start_date) & (df['data'] <= end_date)]
         
         return df
     
@@ -46,61 +51,73 @@ def get_indices_disponiveis():
         "INCC": "INCC (FGV/BCB)"
     }
 
-def get_variacao_indice(indice, data_inicio, data_fim):
+def calcular_correcao_individual(valor_original, data_inicio: date, data_fim: date, indice: str):
     """
-    Calcula a variação acumulada de um índice entre duas datas usando API real
+    Calcula a correção individual seguindo a lógica do exemplo
+    Retorna um dicionário com todos os detalhes do cálculo
     """
-    # Verificar se o índice é suportado
-    if indice not in CODIGOS_INDICES:
-        raise ValueError(f"Índice {indice} não suportado")
+    try:
+        # Buscar dados do índice
+        dados = fetch_bcb_data(CODIGOS_INDICES[indice], data_inicio, data_fim)
+        
+        if dados.empty:
+            raise ValueError(f"Não foram encontrados dados para {indice} no período")
+        
+        # Calcular variação acumulada
+        fator_correcao = (1 + dados['valor']).prod()
+        variacao_percentual = (fator_correcao - 1) * 100
+        valor_corrigido = valor_original * fator_correcao
+        
+        return {
+            'indice': indice,
+            'data_inicio': data_inicio.strftime("%m/%Y"),
+            'data_fim': data_fim.strftime("%m/%Y"),
+            'valor_original': valor_original,
+            'fator_correcao': fator_correcao,
+            'variacao_percentual': variacao_percentual,
+            'valor_corrigido': valor_corrigido,
+            'detalhes': dados
+        }
     
-    # Obter código da série
-    codigo_serie = CODIGOS_INDICES[indice]
-    
-    # Ajustar datas para garantir cobertura
-    start_date = data_inicio - timedelta(days=30)
-    end_date = data_fim
-    
-    # Buscar dados
-    dados = fetch_bcb_data(codigo_serie, start_date, end_date)
-    
-    if dados.empty:
-        raise ValueError(f"Não foi possível obter dados para {indice} no período solicitado")
-    
-    # Filtrar para o período exato
-    mask = (dados.index >= data_inicio) & (dados.index <= data_fim)
-    dados_periodo = dados[mask]
-    
-    if dados_periodo.empty:
-        raise ValueError(f"Nenhum dado disponível para {indice} entre {data_inicio} e {data_fim}")
-    
-    # Calcular variação acumulada
-    variacao_acumulada = (dados_periodo['valor'] + 1).prod() - 1
-    
-    return variacao_acumulada * 100  # Retorna em porcentagem
+    except Exception as e:
+        raise ValueError(f"Erro ao calcular correção com {indice}: {str(e)}")
 
-def calcular_correcao(valor_original, data_original, data_referencia, indices):
+def calcular_correcao_media(valor_original, data_inicio: date, data_fim: date, indices: list):
     """
-    Calcula o valor corrigido com base nos índices selecionados (usando APIs reais)
+    Calcula a correção pela média dos índices
+    Retorna um dicionário com todos os detalhes do cálculo
     """
-    if len(indices) == 1:
-        # Correção por índice único
-        indice = indices[0]
-        variacao = get_variacao_indice(indice, data_original, data_referencia)
-        return valor_original * (1 + variacao / 100)
-    else:
-        # Correção por média de índices
-        variacoes = []
-        for indice in indices:
-            try:
-                variacao = get_variacao_indice(indice, data_original, data_referencia)
-                variacoes.append(variacao)
-            except ValueError as e:
-                st.warning(f"Não foi possível calcular variação para {indice}: {str(e)}")
-                continue
-        
-        if not variacoes:
-            raise ValueError("Nenhum índice válido para cálculo")
-        
-        media_variacoes = sum(variacoes) / len(variacoes)
-        return valor_original * (1 + media_variacoes / 100)
+    resultados = []
+    fatores = []
+    
+    for indice in indices:
+        try:
+            resultado = calcular_correcao_individual(valor_original, data_inicio, data_fim, indice)
+            resultados.append(resultado)
+            fatores.append(resultado['fator_correcao'])
+        except ValueError as e:
+            st.warning(str(e))
+            continue
+    
+    if not fatores:
+        raise ValueError("Nenhum índice válido para cálculo da média")
+    
+    # Calcular média geométrica dos fatores de correção
+    fator_medio = (pd.Series(fatores).prod()) ** (1/len(fatores))
+    variacao_media = (fator_medio - 1) * 100
+    valor_corrigido = valor_original * fator_medio
+    
+    return {
+        'indices': [r['indice'] for r in resultados],
+        'data_inicio': data_inicio.strftime("%m/%Y"),
+        'data_fim': data_fim.strftime("%m/%Y"),
+        'valor_original': valor_original,
+        'fator_correcao': fator_medio,
+        'variacao_percentual': variacao_media,
+        'valor_corrigido': valor_corrigido,
+        'resultados_parciais': resultados
+    }
+
+def formatar_moeda(valor):
+    """Formata valores monetários no padrão brasileiro"""
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
