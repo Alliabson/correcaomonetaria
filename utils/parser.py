@@ -12,90 +12,7 @@ def extract_payment_data(uploaded_file):
         raise ValueError("Formato de arquivo não suportado")
 #Extratos de info dos PDF's
 def extract_from_pdf(pdf_file):
-    """Extrai dados específicos do PDF da Aquarela da Mata com todos os tipos de parcelas"""
-    # Lista completa de todos os tipos de parcelas informados
-    TODOS_TIPOS_PARCELAS = {
-        '0': 'Tipo Zero',
-        '1': 'Tipo Um',
-        '100': 'Tipo Cem',
-        '2': 'Tipo Dois',
-        '200': 'Tipo Duzentos',
-        '3': 'Tipo Três',
-        'A': 'Avulso',
-        'ACF': 'Acerto Financeiro',
-        'ADV': 'Adiantamento',
-        'AM': 'Amortização',
-        'AOD': 'Aporte de Dinheiro',
-        'APS': 'Aporte de Serviços',
-        'AT': 'Ativo',
-        'B': 'Boleto',
-        'BR': 'Boleto Registrado',
-        'C': 'Crédito',
-        'CH': 'Cheque',
-        'CON': 'Consórcio',
-        'CRE': 'Crédito',
-        'CUS': 'Custas',
-        'DE': 'Débito',
-        'DEV': 'Devolução',
-        'DL': 'Diluição',
-        'DLT': 'Diluição Total',
-        'DVA': 'Devolução de Ativo',
-        'E': 'Entrada',
-        'EAP': 'Empréstimo Aporte',
-        'EMP': 'Empréstimo',
-        'ER': 'Estorno',
-        'GCC': 'Guia de Correção de Crédito',
-        'GRC': 'Guia de Regularização de Crédito',
-        'IC': 'Imposto de Consumo',
-        'ID': 'Identificação',
-        'ISS': 'Imposto sobre Serviços',
-        'ITA': 'Item de Acerto',
-        'OP': 'Operação',
-        'P': 'Parcela',
-        'P1': 'Parcela Tipo 1',
-        'PAC': 'Parcela Acordo',
-        'PBC': 'Parcela Boleto Cobrança',
-        'PC': 'Parcela Crédito',
-        'PD1': 'Parcela Débito Tipo 1',
-        'PDT': 'Parcela Débito Total',
-        'PE': 'Parcela Especial',
-        'PG': 'Pagamento',
-        'PI': 'Parcela Inicial',
-        'PI1': 'Parcela Inicial Tipo 1',
-        'PM': 'Parcela Mensal',
-        'PM1': 'Parcela Mensal Tipo 1',
-        'PPS': 'Parcela Programa Social',
-        'PQ': 'Parcela Quadrimestral',
-        'PR': 'Parcela Regular',
-        'PV': 'Parcela Vencida',
-        'R': 'Recibo',
-        'RC': 'Recibo de Crédito',
-        'RCB': 'Recibo de Cobrança',
-        'RCC': 'Recibo de Concessão Crédito',
-        'RCH': 'Recibo de Cheque',
-        'RCI': 'Recibo de Cobertura',
-        'RCP': 'Recibo de Compra',
-        'RD': 'Recibo de Débito',
-        'RDC': 'Recibo de Devolução Crédito',
-        'RDI': 'Recibo de Diligência',
-        'RFT': 'Recibo de Folha de Pagamento',
-        'RP': 'Recibo de Pagamento',
-        'RPI': 'Recibo de Pagamento Inicial',
-        'RPJ': 'Recibo de Pagamento Judicial',
-        'RPR': 'Recibo de Pagamento Regular',
-        'RRE': 'Recibo de Regularização',
-        'RS': 'Recibo de Serviço',
-        'RSD': 'Recibo de Saldo Devedor',
-        'SM': 'Saldo Mensal',
-        'TC': 'Taxa de Condomínio',
-        'TR': 'Transferência',
-        'TRO': 'Troca',
-        'UNM': 'Unidade Monetária',
-        'VA': 'Vale',
-        'VME': 'Vale Mensal',
-        'VTT': 'Vale Transporte'
-    }
-
+    """Extrai dados específicos do PDF da Aquarela da Mata"""
     parcelas = []
     
     with pdfplumber.open(pdf_file) as pdf:
@@ -114,33 +31,35 @@ def extract_from_pdf(pdf_file):
                     header_found = True
                     continue
                 
-                # Processa as linhas de dados
-                if in_payment_table:
+                # Processa as linhas de dados que começam com PR.
+                if in_payment_table and line.strip().startswith('PR.','E.','P.','B.'):
                     # Remove múltiplos espaços e divide corretamente
                     cleaned_line = ' '.join(line.split())
                     parts = cleaned_line.split()
                     
-                    # Verifica se o primeiro elemento é um tipo de parcela conhecido
-                    if parts and parts[0] in TODOS_TIPOS_PARCELAS:
-                        try:
-                            parcela_info = {
-                                'Tipo': parts[0],
-                                'DescricaoTipo': TODOS_TIPOS_PARCELAS[parts[0]],
-                                'Parcela': parts[0],  # Mantém para compatibilidade
-                                'Dt Vencim': parse_date(parts[1]),
-                                'Valor Parcela': parse_currency(parts[3]),
-                                'Dt Recebimento': parse_date(parts[4]),
-                                'Valor Recebido': parse_currency(parts[10])
-                            }
-                            parcelas.append(parcela_info)
-                            
-                        except (IndexError, ValueError) as e:
-                            print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
-                            continue
+                    try:
+                        # Ajuste os índices conforme necessário para o seu PDF
+                        parcela_info = {
+                            'Parcela': parts[0],
+                            'Dt Vencim': parse_date(parts[1]),
+                            'Valor Parcela': parse_currency(parts[3]),
+                            'Dt Recebimento': parse_date(parts[4]),
+                            'Valor Recebido': parse_currency(parts[10])
+                        }
+                        parcelas.append(parcela_info)
+                        
+                    except (IndexError, ValueError) as e:
+                        print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
+                        continue
                 
                 # Finaliza quando encontrar o total
                 if in_payment_table and "Total a pagar:" in line:
                     break
+    
+    if not parcelas:
+        print("Nenhuma parcela encontrada. Linhas disponíveis:")
+        for i, line in enumerate(lines):
+            print(f"{i}: {line}")
     
     return pd.DataFrame(parcelas)
 
