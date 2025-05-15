@@ -3,6 +3,15 @@ import pdfplumber
 from datetime import datetime
 import re
 
+def extract_payment_data(file):
+    """Função unificada para extrair dados de PDF ou Excel"""
+    if file.name.lower().endswith('.pdf'):
+        return extract_from_pdf(file)
+    elif file.name.lower().endswith(('.xls', '.xlsx')):
+        return extract_from_excel(file)
+    else:
+        raise ValueError("Formato de arquivo não suportado")
+
 def extract_from_pdf(pdf_file):
     """Extrai dados específicos do PDF com tratamento para formatos complexos"""
     parcelas = []
