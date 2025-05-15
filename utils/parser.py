@@ -11,33 +11,36 @@ def extract_payment_data(uploaded_file):
         return extract_from_excel(uploaded_file)
     else:
         raise ValueError("Formato de arquivo não suportado")
-
+# Parcelas
 def extract_from_pdf(pdf_file):
-    """
-    Extrai dados de parcelas de um PDF no formato do exemplo
-    """
+    """Extrai dados de parcelas de um PDF no formato do exemplo"""
     parcelas = []
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            
-            # Exemplo de extração - ajustar conforme o layout real do PDF
             lines = text.split('\n')
             
-            # Procurar por linhas que contêm dados de parcelas
             for line in lines:
                 if line.startswith('PR.'):  # Identifica linhas de parcelas
                     parts = line.split()
                     
                     try:
+                        # Corrigir o parsing da data
+                        data_vencimento = pd.to_datetime(parts[1], format='%d/%m/%Y').date()
+                        
+                        # Corrigir o parsing do valor (tratando vírgula decimal)
+                        valor_str = parts[2].replace('.', '').replace(',', '.')
+                        valor = float(valor_str)
+                        
                         parcela = {
                             'Parcela': parts[0],
-                            'Dt Vencim': pd.to_datetime(parts[1], format='%d/%m/%Y'),
-                            'Valor Parcela': float(parts[2].replace('.', '').replace(',', '.'))
+                            'Dt Vencim': data_vencimento,
+                            'Valor Parcela': valor
                         }
                         parcelas.append(parcela)
-                    except (IndexError, ValueError):
+                    except (IndexError, ValueError) as e:
+                        print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
                         continue
     
     return pd.DataFrame(parcelas)
