@@ -1,9 +1,8 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import pytz
-from utils.parser import extract_payment_data
+from utils import extract_payment_data
 from utils.indices import *
 
 # Configuração da página
