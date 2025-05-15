@@ -6,11 +6,19 @@ import sys
 import os
 import locale
 
-# Configura localização para formatação monetária
+# Configuração de locale com fallback seguro
 try:
     locale.setlocale(locale.LC_ALL, 'pt_BR.UTF-8')
-except:
-    locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
+except locale.Error:
+    try:
+        locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
+    except locale.Error:
+        try:
+            locale.setlocale(locale.LC_ALL, 'pt_BR')
+        except locale.Error:
+            # Fallback para locale padrão do sistema
+            locale.setlocale(locale.LC_ALL, '')
+            st.warning("Locale específico não disponível. Usando configuração padrão do sistema.")
 
 # Configura caminhos para imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
