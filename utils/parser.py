@@ -42,7 +42,7 @@ def extract_from_pdf_with_tables(pdf_file):
                             valor_recebido = 0.0
                             
                             for i, cell in enumerate(row[3:], 3):
-                                if cell and parse_date(str(cell))):
+                                if cell and parse_date(str(cell)):
                                     dt_receb = parse_date(str(cell))
                                     if i+1 < len(row) and row[i+1]:
                                         valor_recebido = parse_currency(str(row[i+1]))
