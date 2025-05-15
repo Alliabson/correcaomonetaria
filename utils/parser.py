@@ -15,6 +15,16 @@ def extract_from_pdf(pdf_file):
     """Extrai dados específicos do PDF da Aquarela da Mata"""
     parcelas = []
     
+    # Lista completa de prefixos encontrados nos dados
+    prefixos_validos = [
+        '0', '1', '100', '2', '200', '3', 'A', 'ACF', 'ADV', 'AM', 'AOD', 'APS', 'AT', 'B', 'BR',
+        'C', 'CH', 'CON', 'CRE', 'CUS', 'DE', 'DEV', 'DL', 'DLT', 'DVA', 'E', 'EAP', 'EMP', 'ER',
+        'GCC', 'GRC', 'IC', 'ID', 'ISS', 'ITA', 'OP', 'P', 'P1', 'PAC', 'PBC', 'PC', 'PD1', 'PDT',
+        'PE', 'PG', 'PI', 'PI1', 'PM', 'PM1', 'PPS', 'PQ', 'PR', 'PV', 'R', 'RC', 'RCB', 'RCC',
+        'RCH', 'RCI', 'RCP', 'RD', 'RDC', 'RDI', 'RFT', 'RP', 'RPI', 'RPJ', 'RPR', 'RRE', 'RS',
+        'RSD', 'SM', 'TC', 'TR', 'TRO', 'UNM', 'VA', 'VME', 'VTT'
+    ]
+    
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
@@ -31,8 +41,8 @@ def extract_from_pdf(pdf_file):
                     header_found = True
                     continue
                 
-                # Processa as linhas de dados que começam com PR.
-                if in_payment_table and line.strip().startswith('P.'):
+                # Processa as linhas de dados que começam com qualquer um dos prefixos válidos
+                if in_payment_table and any(line.strip().startswith(prefix + '.') for prefix in prefixos_validos):
                     # Remove múltiplos espaços e divide corretamente
                     cleaned_line = ' '.join(line.split())
                     parts = cleaned_line.split()
