@@ -5,14 +5,24 @@ import pytz
 import sys
 import os
 
-# Adiciona o diretório utils ao path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Corrigindo a linha com o parêntese faltante
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Alternativa mais segura para imports
 try:
     from utils.parser import extract_payment_data
-    from utils.indices import *
+    from utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
 except ImportError as e:
-    st.error(f"Erro ao importar módulos: {str(e)}")
+    st.error(f"Erro crítico ao importar módulos: {str(e)}")
+    st.error("Por favor, verifique a estrutura de arquivos:")
+    st.error(f"Caminho atual: {os.getcwd()}")
+    st.error(f"Conteúdo do diretório: {os.listdir()}")
+    if not os.path.exists('utils'):
+        st.error("Diretório 'utils' não encontrado!")
+    elif not os.path.exists('utils/parser.py'):
+        st.error("Arquivo 'parser.py' não encontrado em 'utils'!")
+    elif not os.path.exists('utils/indices.py'):
+        st.error("Arquivo 'indices.py' não encontrado em 'utils'!")
     st.stop()
 
 
