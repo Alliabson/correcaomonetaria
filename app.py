@@ -2,40 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 import pytz
-import os
-import sys
-from pathlib import Path
-
-# SOLUÇÃO DEFINITIVA PARA OS IMPORTS
-try:
-    # Tentativa 1: Importar normalmente
-    from utils.parser import extract_payment_data
-    from utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
-except ImportError:
-    try:
-        # Tentativa 2: Importar usando caminho absoluto
-        from .utils.parser import extract_payment_data
-        from .utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
-    except ImportError:
-        try:
-            # Tentativa 3: Adicionar o diretório ao path
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            utils_path = os.path.join(current_dir, 'utils')
-            sys.path.append(utils_path)
-            
-            from parser import extract_payment_data
-            from indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
-        except ImportError as e:
-            st.error(f"Falha crítica ao importar módulos: {str(e)}")
-            st.error("Por favor, verifique se a pasta 'utils' está no local correto.")
-            st.error(f"Caminho atual: {os.path.abspath(__file__)}")
-            st.stop()
-
-# Função auxiliar para formatação de moeda
-def formatar_moeda(valor):
-    if pd.isna(valor):
-        return "R$ 0,00"
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+from utils.parser import extract_payment_data
+from utils.indices import *
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
@@ -78,7 +46,7 @@ else:
     indices_para_calculo = indices_selecionados if len(indices_selecionados) >= 2 else ["IGPM", "IPCA", "INCC"]
     st.sidebar.info("Selecione pelo menos 2 índices para calcular a média.")
 
-# Data de referência para correção
+# Data de referência para correção (formatada em PT-BR)
 data_referencia = st.sidebar.date_input(
     "Data de referência para correção",
     value=datetime.now(pytz.timezone('America/Sao_Paulo')).date(),
@@ -177,10 +145,11 @@ if uploaded_file is not None:
                     st.subheader("Exportar Resultados")
                     
                     # Converter dataframe para Excel
-                    output_path = "resultado_correcao.xlsx"
-                    df_resultados.to_excel(output_path, index=False, sheet_name='Parcelas Corrigidas')
+                    output = pd.ExcelWriter("resultado_correcao.xlsx", engine='xlsxwriter')
+                    df_resultados.to_excel(output, index=False, sheet_name='Parcelas Corrigidas')
+                    output.close()
                     
-                    with open(output_path, "rb") as file:
+                    with open("resultado_correcao.xlsx", "rb") as file:
                         st.download_button(
                             label="Baixar Resultados em Excel",
                             data=file,
