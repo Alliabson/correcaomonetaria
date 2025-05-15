@@ -1,10 +1,9 @@
-# app.py (atualizado)
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import pytz
 from utils.parser import extract_payment_data
-from utils.indices import calcular_correcao, get_indices_disponiveis
+from utils.indices import *
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
@@ -67,69 +66,98 @@ if uploaded_file is not None:
             
             # Mostrar dados brutos
             st.subheader("Parcelas Identificadas")
-            st.dataframe(parcelas_df)
+            st.dataframe(parcelas_df.style.format({
+                'Valor Parcela': lambda x: formatar_moeda(x)
+            }))
             
             # Só processa quando o botão for clicado
             if calcular:
                 # Aplicar correção monetária
                 st.subheader("Correção Monetária Aplicada")
                 
-                # Copiar dataframe para não modificar o original
-                df_corrigido = parcelas_df.copy()
+                # Lista para armazenar resultados
+                resultados = []
                 
-                # Aplicar correção para cada parcela
-                for idx, row in df_corrigido.iterrows():
+                for idx, row in parcelas_df.iterrows():
                     valor_original = row['Valor Parcela']
                     data_vencimento = row['Dt Vencim']
                     
                     try:
-                        # Calcular correção
-                        valor_corrigido = calcular_correcao(
-                            valor_original=valor_original,
-                            data_original=data_vencimento,
-                            data_referencia=data_referencia,
-                            indices=indices_para_calculo
-                        )
+                        # Converter para date se for datetime
+                        if isinstance(data_vencimento, pd.Timestamp):
+                            data_vencimento = data_vencimento.date()
                         
-                        # Adicionar ao dataframe
-                        df_corrigido.at[idx, 'Valor Corrigido'] = valor_corrigido
-                        df_corrigido.at[idx, 'Variação (%)'] = ((valor_corrigido - valor_original) / valor_original) * 100
-                        df_corrigido.at[idx, 'Variação (R$)'] = valor_corrigido - valor_original
+                        if metodo_correcao == "Índice Único":
+                            correcao = calcular_correcao_individual(
+                                valor_original,
+                                data_vencimento,
+                                data_referencia,
+                                indices_para_calculo[0]
+                            )
+                        else:
+                            correcao = calcular_correcao_media(
+                                valor_original,
+                                data_vencimento,
+                                data_referencia,
+                                indices_para_calculo
+                            )
+                        
+                        # Adicionar ao dataframe de resultados
+                        resultados.append({
+                            'Parcela': row['Parcela'],
+                            'Dt Vencim': data_vencimento.strftime("%d/%m/%Y"),
+                            'Valor Original': valor_original,
+                            'Índice(s)': ', '.join(indices_para_calculo) if metodo_correcao == "Média de Índices" else indices_para_calculo[0],
+                            'Fator de Correção': correcao['fator_correcao'],
+                            'Variação (%)': correcao['variacao_percentual'],
+                            'Valor Corrigido': correcao['valor_corrigido']
+                        })
                     
                     except Exception as e:
                         st.error(f"Erro ao corrigir parcela {row['Parcela']}: {str(e)}")
                         continue
                 
-                # Mostrar resultados
-                st.dataframe(df_corrigido)
-                
-                # Resumo estatístico
-                st.subheader("Resumo Estatístico")
-                col1, col2, col3 = st.columns(3)
-                
-                total_original = df_corrigido['Valor Parcela'].sum()
-                total_corrigido = df_corrigido['Valor Corrigido'].sum()
-                variacao_total = total_corrigido - total_original
-                
-                col1.metric("Total Original", f"R$ {total_original:,.2f}")
-                col2.metric("Total Corrigido", f"R$ {total_corrigido:,.2f}")
-                col3.metric("Variação Total", f"R$ {variacao_total:,.2f}")
-                
-                # Opção para exportar resultados
-                st.subheader("Exportar Resultados")
-                
-                # Converter dataframe para Excel
-                output = pd.ExcelWriter("resultado_correcao.xlsx", engine='xlsxwriter')
-                df_corrigido.to_excel(output, index=False, sheet_name='Parcelas Corrigidas')
-                output.close()
-                
-                with open("resultado_correcao.xlsx", "rb") as file:
-                    st.download_button(
-                        label="Baixar Resultados em Excel",
-                        data=file,
-                        file_name="resultado_correcao.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                if resultados:
+                    # Criar DataFrame com resultados
+                    df_resultados = pd.DataFrame(resultados)
+                    
+                    # Mostrar resultados formatados
+                    st.dataframe(df_resultados.style.format({
+                        'Valor Original': formatar_moeda,
+                        'Fator de Correção': "{:.8f}",
+                        'Variação (%)': "{:.6f}%",
+                        'Valor Corrigido': formatar_moeda
+                    }))
+                    
+                    # Resumo estatístico
+                    st.subheader("Resumo Estatístico")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    total_original = df_resultados['Valor Original'].sum()
+                    total_corrigido = df_resultados['Valor Corrigido'].sum()
+                    variacao_total = total_corrigido - total_original
+                    
+                    col1.metric("Total Original", formatar_moeda(total_original))
+                    col2.metric("Total Corrigido", formatar_moeda(total_corrigido))
+                    col3.metric("Variação Total", formatar_moeda(variacao_total))
+                    
+                    # Opção para exportar resultados
+                    st.subheader("Exportar Resultados")
+                    
+                    # Converter dataframe para Excel
+                    output = pd.ExcelWriter("resultado_correcao.xlsx", engine='xlsxwriter')
+                    df_resultados.to_excel(output, index=False, sheet_name='Parcelas Corrigidas')
+                    output.close()
+                    
+                    with open("resultado_correcao.xlsx", "rb") as file:
+                        st.download_button(
+                            label="Baixar Resultados em Excel",
+                            data=file,
+                            file_name="resultado_correcao.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                else:
+                    st.warning("Nenhuma parcela foi corrigida com sucesso.")
             
         else:
             st.warning("Nenhuma parcela foi identificada no documento.")
