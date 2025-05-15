@@ -4,26 +4,33 @@ from datetime import datetime, date
 import pytz
 import sys
 import os
-import locale
+from typing import Union, List
 
-# Configuração de locale com fallback seguro
-try:
-    locale.setlocale(locale.LC_ALL, 'pt_BR.UTF-8')
-except locale.Error:
+# Configuração da página DEVE SER O PRIMEIRO COMANDO
+st.set_page_config(
+    page_title="Correção Monetária de Relatórios", 
+    layout="wide",
+    page_icon="📈"
+)
+
+# Função de formatação de moeda independente de locale
+def formatar_moeda(valor: Union[float, str]) -> str:
+    """Formata valores monetários sem dependência de locale"""
     try:
-        locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
-    except locale.Error:
-        try:
-            locale.setlocale(locale.LC_ALL, 'pt_BR')
-        except locale.Error:
-            # Fallback para locale padrão do sistema
-            locale.setlocale(locale.LC_ALL, '')
-            st.warning("Locale específico não disponível. Usando configuração padrão do sistema.")
+        if pd.isna(valor) or valor == '':
+            return "R$ 0,00"
+        
+        valor_float = float(valor)
+        # Formatação manual: R$ 1.234,56
+        return f"R$ {valor_float:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception as e:
+        st.warning(f"Erro ao formatar valor {valor}: {str(e)}")
+        return "R$ 0,00"
 
-# Configura caminhos para imports
+# Configura caminhos para imports (após set_page_config)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Imports com tratamento de erro detalhado
+# Imports com tratamento de erro
 try:
     from utils.parser import extract_payment_data
     from utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
@@ -38,26 +45,7 @@ except ImportError as e:
     """)
     st.stop()
 
-# Configuração da página
-st.set_page_config(
-    page_title="Correção Monetária de Relatórios", 
-    layout="wide",
-    page_icon="📈"
-)
-
 # Funções auxiliares
-def formatar_moeda(valor: Union[float, str]) -> str:
-    """Formata valores monetários para exibição"""
-    try:
-        if pd.isna(valor) or valor == '':
-            return "R$ 0,00"
-        
-        valor_float = float(valor)
-        return locale.currency(valor_float, grouping=True, symbol=True)
-    except Exception as e:
-        st.warning(f"Erro ao formatar valor {valor}: {str(e)}")
-        return "R$ 0,00"
-
 def mostrar_resumo(df: pd.DataFrame):
     """Exibe um resumo estatístico do DataFrame"""
     if df.empty:
