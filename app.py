@@ -79,8 +79,7 @@ if uploaded_file is not None:
                 resultados = []
                 
                 for idx, row in parcelas_df.iterrows():
-                    # valor_original = row['Valor Parcela']
-                    valor_original = row['Valor Parc.']
+                    valor_original = row['Valor Parcela']
                     data_vencimento = row['Dt Vencim']
                     
                     try:
