@@ -3,94 +3,50 @@ import pdfplumber
 from datetime import datetime
 import re
 
-def extract_payment_data(file):
-    """Função unificada para extrair dados de PDF ou Excel"""
-    if file.name.lower().endswith('.pdf'):
-        return extract_from_pdf(file)
-    elif file.name.lower().endswith(('.xls', '.xlsx')):
-        return extract_from_excel(file)
-    else:
-        raise ValueError("Formato de arquivo não suportado")
-
 def extract_from_pdf(pdf_file):
-    """Extrai dados específicos do PDF com tratamento para formatos complexos"""
+    """Extrai dados de parcelas de PDFs complexos com tabelas mal formatadas"""
     parcelas = []
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
+            if not text:
+                continue
+                
             lines = text.split('\n')
-            
-            in_payment_table = False
+            in_table = False
             header_found = False
             
             for line in lines:
-                # Verificação flexível de cabeçalho
-                if ("Parcela" in line and "Dt Vencim" in line and "Valor Parc." in line and 
-                    "Dt. Receb." in line and "Vlr da Parcela" in line):
-                    in_payment_table = True
+                # Verifica se é o cabeçalho da tabela
+                if ("Parcela" in line and "Dt Vencim" in line and 
+                    "Valor Parc." in line and "Vlr da Parcela" in line):
+                    in_table = True
                     header_found = True
                     continue
                 
-                # Processa linhas dentro da tabela
-                if in_payment_table and line.strip():
-                    # Padrão melhorado para identificar prefixos variados (E., P., B., etc.)
-                    parcela_pattern = r'^([A-Z]\.\d+/\d+|B\.\d+/\d+)'
-                    match = re.search(parcela_pattern, line.strip())
-                    
-                    if match:
+                if in_table:
+                    # Padrão para identificar linhas de parcelas
+                    parcela_match = re.match(r'^([A-Z]{1,3}\.\d+/\d+)', line.strip())
+                    if parcela_match:
                         try:
-                            # Limpa e divide a linha mantendo os valores juntos
-                            cleaned_line = ' '.join(line.split())
-                            parts = re.split(r'\s{2,}', cleaned_line)  # Divide por múltiplos espaços
-                            
-                            # Extrai parcela (mantém o formato original)
-                            parcela = parts[0]
-                            
-                            # Converte data de vencimento (formato DD/MM/AAAA)
-                            dt_vencim = datetime.strptime(parts[1], '%d/%m/%Y').date()
-                            
-                            # Extrai valor da parcela (trata diferentes formatos)
-                            valor_parc_str = parts[2].replace('.', '').replace(',', '.')
-                            valor_parcela = float(valor_parc_str)
-                            
-                            # Verifica se há data de recebimento (pode estar vazia)
-                            dt_receb = None
-                            valor_recebido = 0.0
-                            
-                            if len(parts) > 3 and '/' in parts[3]:
-                                dt_receb = datetime.strptime(parts[3], '%d/%m/%Y').date()
-                                
-                                # O valor recebido está na última coluna (Vlr da Parcela)
-                                if len(parts) > 4:
-                                    valor_receb_str = parts[-1].replace('.', '').replace(',', '.')
-                                    valor_recebido = float(valor_receb_str)
-                            
-                            # Adiciona à lista de parcelas
-                            parcela_info = {
-                                'Parcela': parcela,
-                                'Dt Vencim': dt_vencim,
-                                'Valor Parcela': valor_parcela,
-                                'Dt Recebimento': dt_receb,
-                                'Valor Recebido': valor_recebido,
-                                'Status Pagamento': 'Pago' if valor_recebido > 0 else 'Pendente',
-                                'Arquivo Origem': pdf_file.name
-                            }
-                            parcelas.append(parcela_info)
-                            
-                        except (IndexError, ValueError, AttributeError) as e:
-                            print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
+                            # Processa a linha da parcela
+                            parcela_data = process_parcela_line(line)
+                            if parcela_data:
+                                parcelas.append(parcela_data)
+                        except Exception as e:
+                            print(f"Erro ao processar linha: {line}\nErro: {str(e)}")
                             continue
-                
-                # Finaliza quando encontrar o total
-                if in_payment_table and any(t in line for t in ["Total a pagar:", "TOTAL GERAL:"]):
-                    break
+                    
+                    # Verifica fim da tabela
+                    if any(x in line for x in ["Total a pagar:", "Ano:", "TOTAL GERAL:"]):
+                        in_table = False
     
     # Cria DataFrame
     df = pd.DataFrame(parcelas)
     
     if not df.empty:
-        # Calcula dias de atraso e valor pendente para cada linha individual
+        # Calcula campos adicionais
         df['Dias Atraso'] = df.apply(
             lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
             if x['Dt Recebimento'] and x['Dt Recebimento'] > x['Dt Vencim'] 
@@ -98,21 +54,64 @@ def extract_from_pdf(pdf_file):
             axis=1
         )
         df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
+        df['Status Pagamento'] = df['Valor Recebido'].apply(
+            lambda x: 'Pago' if x > 0 else 'Pendente'
+        )
     
-    return df
+    return df if not df.empty else pd.DataFrame()
+
+def process_parcela_line(line):
+    """Processa uma linha de parcela individual"""
+    # Normaliza espaços e remove caracteres problemáticos
+    cleaned = re.sub(r'\s+', ' ', line.strip())
+    
+    # Extrai os componentes principais
+    parts = re.split(r'\s{2,}', cleaned)  # Divide por múltiplos espaços
+    
+    # Padrão para identificar parcelas (E.1/1, P.1/144, B.1/12, etc.)
+    parcela_pattern = r'^([A-Z]{1,3}\.\d+/\d+)'
+    parcela_match = re.match(parcela_pattern, parts[0])
+    if not parcela_match:
+        return None
+    
+    # Extrai os dados básicos
+    parcela = parcela_match.group(1)
+    dt_vencim = parse_date(parts[1]) if len(parts) > 1 else None
+    valor_parc = parse_currency(parts[2]) if len(parts) > 2 else 0
+    
+    # Encontra a data de recebimento (pode estar em posições variáveis)
+    dt_receb = None
+    valor_recebido = 0
+    
+    for i, part in enumerate(parts):
+        if re.match(r'\d{2}/\d{2}/\d{4}', part):
+            # Assume que após a data de receb vem o valor recebido
+            dt_receb = parse_date(part)
+            if len(parts) > i+1:
+                valor_recebido = parse_currency(parts[i+1])
+            break
+    
+    return {
+        'Parcela': parcela,
+        'Dt Vencim': dt_vencim,
+        'Valor Parcela': valor_parc,
+        'Dt Recebimento': dt_receb,
+        'Valor Recebido': valor_recebido,
+        'Arquivo Origem': 'PDF'
+    }
 
 def parse_date(date_str):
-    """Converte string de data no formato DD/MM/YYYY para objeto date"""
+    """Converte string de data para objeto date"""
     try:
         return datetime.strptime(date_str, '%d/%m/%Y').date()
     except (ValueError, TypeError):
         return None
 
 def parse_currency(value_str):
-    """Converte valores monetários com vírgula decimal para float"""
+    """Converte valores monetários para float"""
     try:
-        cleaned_value = str(value_str).replace('R$', '').strip()
-        return float(cleaned_value.replace('.', '').replace(',', '.'))
+        cleaned = str(value_str).replace('R$', '').replace('.', '').replace(',', '.').strip()
+        return float(cleaned)
     except (ValueError, AttributeError):
         return 0.0
 
