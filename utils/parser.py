@@ -32,7 +32,7 @@ def extract_from_pdf(pdf_file):
                     continue
                 
                 # Processa as linhas de dados que começam com PR.
-                if in_payment_table and line.strip().startswith('PR.','E.','P.','B.'):
+                if in_payment_table and line.strip().startswith('P.'):
                     # Remove múltiplos espaços e divide corretamente
                     cleaned_line = ' '.join(line.split())
                     parts = cleaned_line.split()
