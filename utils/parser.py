@@ -34,8 +34,8 @@ def extract_from_pdf(pdf_file):
                 
                 # Processa linhas dentro da tabela
                 if in_payment_table and line.strip():
-                    # Padrão para identificar linhas de parcelas
-                    parcela_pattern = r'^([A-Z]\.\d+/\d+|P\.\d+/\d+|E\.\d+/\d+)'
+                    # Padrão melhorado para identificar prefixos variados (PR., BR., SM., etc.)
+                    parcela_pattern = r'^([A-Z]{1,3}\.\d+/\d+)'
                     match = re.search(parcela_pattern, line.strip())
                     
                     if match:
@@ -43,7 +43,7 @@ def extract_from_pdf(pdf_file):
                         parts = cleaned_line.split()
                         
                         try:
-                            # Extrai parcela
+                            # Extrai parcela (mantém o formato original)
                             parcela = parts[0]
                             
                             # Converte data de vencimento (formato DDMM/AAAA)
@@ -66,7 +66,7 @@ def extract_from_pdf(pdf_file):
                                     valor_receb_str = parts[4].replace('.', '').replace(',', '.')
                                     valor_recebido = float(valor_receb_str)
                             
-                            # Adiciona à lista de parcelas
+                            # Adiciona à lista de parcelas (mantém todas as entradas)
                             parcela_info = {
                                 'Parcela': parcela,
                                 'Dt Vencim': dt_vencim,
@@ -86,21 +86,15 @@ def extract_from_pdf(pdf_file):
                 if in_payment_table and any(t in line for t in ["Total a pagar:", "TOTAL GERAL:"]):
                     break
     
-    # Consolida múltiplos pagamentos para a mesma parcela
+    # Cria DataFrame sem agrupar (mantém todas as linhas originais)
     df = pd.DataFrame(parcelas)
+    
     if not df.empty:
-        # Agrupa por parcela e data de vencimento, somando os valores recebidos
-        df = df.groupby(['Parcela', 'Dt Vencim']).agg({
-            'Valor Parcela': 'first',
-            'Dt Recebimento': lambda x: x.dropna().iloc[0] if not x.dropna().empty else None,
-            'Valor Recebido': 'sum',
-            'Status Pagamento': lambda x: 'Pago' if any(s == 'Pago' for s in x) else 'Pendente',
-            'Arquivo Origem': 'first'
-        }).reset_index()
-        
-        # Calcula dias de atraso e valor pendente
+        # Calcula dias de atraso e valor pendente para cada linha individual
         df['Dias Atraso'] = df.apply(
-            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days if x['Dt Recebimento'] and x['Dt Recebimento'] > x['Dt Vencim'] else 0,
+            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
+            if x['Dt Recebimento'] and x['Dt Recebimento'] > x['Dt Vencim'] 
+            else 0,
             axis=1
         )
         df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
