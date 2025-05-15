@@ -6,20 +6,9 @@ from datetime import datetime
 import pytz
 from utils.indices import *
 
-# Configuração da página
-st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
-
-# Título e descrição
-st.title("📊 Correção Monetária Avançada")
-st.markdown("""
-Extração completa de tabelas de PDF e correção monetária seletiva.
-""")
-
-# Funções de processamento
-def extract_table_from_pdf(pdf_file):
-    """Extrai a tabela completa do PDF com abordagem direta"""
-    table_data = []
-    headers = []
+def extract_payments_from_pdf(pdf_file):
+    """Função otimizada para extrair dados do PDF específico"""
+    payments = []
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
@@ -28,33 +17,42 @@ def extract_table_from_pdf(pdf_file):
                 continue
                 
             lines = text.split('\n')
-            in_table = False
+            start_processing = False
             
             for line in lines:
-                # Identifica o cabeçalho da tabela
-                if "Parcela" in line and "DI Veném" in line and "Valor Parc." in line:
-                    in_table = True
-                    headers = [h.strip() for h in re.split(r'\s{2,}', line.strip())]
+                # Identifica o início da tabela
+                if "Parcela DI Veném Atraso Valor Parc. Di. Receb. Vir da Parcela" in line:
+                    start_processing = True
                     continue
-                
-                if in_table:
-                    # Padrão para identificar linhas de parcelas
-                    if re.match(r'^(E|P)\.\d+/\d+', line.strip()):
-                        # Divide a linha mantendo a estrutura das colunas
-                        parts = re.split(r'\s{2,}', line.strip())
-                        
-                        # Garante que temos valores para todas as colunas
-                        if len(parts) >= len(headers):
-                            table_data.append(parts[:len(headers)])
-                        elif len(parts) > 3:  # Pelo menos Parcela, Data, Valor
-                            row = parts + [""] * (len(headers) - len(parts))
-                            table_data.append(row)
                     
-                    # Finaliza quando encontrar o total
+                if start_processing:
+                    # Verifica se é uma linha de pagamento
+                    if re.match(r'^(E|P)\.\d+/\d+', line.strip()):
+                        try:
+                            # Extrai os componentes usando posições fixas (ajuste conforme necessário)
+                            parcela = line[0:10].strip()
+                            dt_venc = line[10:20].strip()
+                            valor_parc = line[30:45].strip()
+                            dt_receb = line[45:55].strip()
+                            valor_receb = line[55:70].strip()
+                            
+                            payments.append({
+                                'Parcela': parcela,
+                                'Dt Vencimento': dt_venc,
+                                'Valor Parcela': valor_parc,
+                                'Dt Recebimento': dt_receb,
+                                'Valor Recebido': valor_receb
+                            })
+                            
+                        except Exception as e:
+                            st.warning(f"Erro ao processar linha: {line[:50]}... | Erro: {str(e)}")
+                            continue
+                    
+                    # Finaliza ao encontrar o total
                     if "Total a pagar:" in line:
                         break
     
-    return headers, table_data
+    return payments
 
 def parse_custom_date(date_str):
     """Converte datas no formato DDMM/AAAA"""
@@ -62,9 +60,6 @@ def parse_custom_date(date_str):
         date_str = str(date_str).strip()
         if not date_str or date_str.lower() == 'nan':
             return None
-        
-        # Remove texto adicional (como "Atraso")
-        date_str = re.sub(r'[^0-9/]', '', date_str)
         
         # Formato DDMM/AAAA
         if len(date_str) == 8 and '/' in date_str:
@@ -84,7 +79,7 @@ def parse_custom_currency(value_str):
         if not value_str or value_str.lower() == 'nan':
             return 0.0
             
-        # Remove R$ e espaços, trata vírgula decimal
+        # Remove caracteres não numéricos e converte vírgula para ponto
         cleaned = re.sub(r'[^\d,]', '', value_str).replace(',', '.')
         return float(cleaned)
     except:
@@ -98,153 +93,117 @@ def format_currency(value):
         return "R$ 0,00"
 
 # Interface principal
+st.set_page_config(page_title="Correção Monetária", layout="wide")
+st.title("📊 Correção Monetária de Parcelas")
+
 uploaded_file = st.file_uploader("Carregue o arquivo PDF", type=["pdf"])
 
 if uploaded_file:
     try:
-        # Extração da tabela
-        with st.spinner("Extraindo tabela do PDF..."):
-            headers, table_data = extract_table_from_pdf(uploaded_file)
+        with st.spinner("Processando arquivo..."):
+            payments = extract_payments_from_pdf(uploaded_file)
             
-            if not table_data:
-                st.error("Nenhuma tabela foi identificada no documento.")
+            if not payments:
+                st.error("Nenhum pagamento encontrado no documento. Estrutura do arquivo:")
+                with pdfplumber.open(uploaded_file) as pdf:
+                    st.text(pdf.pages[0].extract_text()[:1000])  # Mostra parte do conteúdo para debug
                 st.stop()
             
-            # Cria DataFrame com todas as colunas originais
-            df = pd.DataFrame(table_data, columns=headers)
+            df = pd.DataFrame(payments)
             
-            # Processa colunas de data e valor
-            df['Data Vencimento'] = df['DI Veném Atraso'].apply(parse_custom_date)
-            df['Valor Original'] = df['Valor Parc.'].apply(parse_custom_currency)
-            df['Valor Recebido'] = df['Vlr da Parcela'].apply(parse_custom_currency)
+            # Processa colunas importantes
+            df['Data Vencimento'] = df['Dt Vencimento'].apply(parse_custom_date)
+            df['Valor Original'] = df['Valor Parcela'].apply(parse_custom_currency)
+            df['Valor Recebido'] = df['Valor Recebido'].apply(parse_custom_currency)
             
-            st.success(f"Tabela extraída com {len(df)} parcelas!")
-
-            # Seleção de colunas para exibição
-            st.subheader("Selecione as colunas para exibir")
-            colunas_selecionadas = st.multiselect(
-                "Colunas disponíveis",
-                options=headers + ['Data Vencimento', 'Valor Original', 'Valor Recebido'],
-                default=['Parcela', 'Data Vencimento', 'Valor Original', 'Valor Recebido']
-            )
+            st.success(f"✅ {len(df)} parcelas extraídas com sucesso!")
             
-            # Mostra tabela filtrada
-            st.dataframe(df[colunas_selecionadas].style.format({
-                'Valor Original': format_currency,
-                'Valor Recebido': format_currency
-            }))
+            # Mostra dados brutos
+            st.subheader("Dados Extraídos")
+            st.dataframe(df)
             
             # Configuração da correção
-            st.sidebar.header("Parâmetros de Correção")
+            st.sidebar.header("Configuração")
             
-            metodo_correcao = st.sidebar.radio(
-                "Método de Correção",
-                options=["Índice Único", "Média de Índices"],
-                index=0
-            )
+            metodo = st.sidebar.radio("Método", ["Índice Único", "Média de Índices"])
+            indices = get_indices_disponiveis()
             
-            indices_disponiveis = get_indices_disponiveis()
-            
-            if metodo_correcao == "Índice Único":
-                indice_selecionado = st.sidebar.selectbox(
-                    "Selecione o índice econômico",
-                    options=list(indices_disponiveis.keys()),
-                    index=0
-                )
-                indices_para_calculo = [indice_selecionado]
+            if metodo == "Índice Único":
+                indice = st.sidebar.selectbox("Índice", options=list(indices.keys()))
+                indices_para_calculo = [indice]
             else:
-                indices_selecionados = st.sidebar.multiselect(
-                    "Selecione os índices para cálculo da média",
-                    options=list(indices_disponiveis.keys()),
-                    default=["IGPM", "IPCA", "INCC"]
+                selecionados = st.sidebar.multiselect(
+                    "Índices para média",
+                    options=list(indices.keys()),
+                    default=["IGPM", "IPCA"]
                 )
-                indices_para_calculo = indices_selecionados if len(indices_selecionados) >= 2 else ["IGPM", "IPCA", "INCC"]
+                indices_para_calculo = selecionados if len(selecionados) >= 2 else ["IGPM", "IPCA"]
             
-            data_referencia = st.sidebar.date_input(
-                "Data de referência para correção",
-                value=datetime.now(pytz.timezone('America/Sao_Paulo')).date(),
-                format="DD/MM/YYYY"
-            )
+            data_ref = st.sidebar.date_input("Data referência", datetime.now().date())
             
-            if st.button("Aplicar Correção Monetária"):
-                # Aplicar correção
+            if st.button("Calcular Correção"):
                 resultados = []
                 
-                for idx, row in df.iterrows():
+                for _, row in df.iterrows():
                     try:
                         if pd.isna(row['Data Vencimento']) or pd.isna(row['Valor Original']):
                             continue
                             
-                        if metodo_correcao == "Índice Único":
+                        if metodo == "Índice Único":
                             correcao = calcular_correcao_individual(
                                 row['Valor Original'],
                                 row['Data Vencimento'],
-                                data_referencia,
+                                data_ref,
                                 indices_para_calculo[0]
                             )
                         else:
                             correcao = calcular_correcao_media(
                                 row['Valor Original'],
                                 row['Data Vencimento'],
-                                data_referencia,
+                                data_ref,
                                 indices_para_calculo
                             )
                         
-                        # Adiciona resultado
-                        resultado = {
+                        resultados.append({
                             'Parcela': row['Parcela'],
                             'Data Vencimento': row['Data Vencimento'].strftime("%d/%m/%Y"),
                             'Valor Original': row['Valor Original'],
-                            'Valor Recebido': row['Valor Recebido'],
-                            'Índice(s)': ', '.join(indices_para_calculo) if metodo_correcao == "Média de Índices" else indices_para_calculo[0],
-                            'Fator de Correção': correcao['fator_correcao'],
-                            'Variação (%)': correcao['variacao_percentual'],
-                            'Valor Corrigido': correcao['valor_corrigido']
-                        }
-                        resultados.append(resultado)
+                            'Índice(s)': ', '.join(indices_para_calculo),
+                            'Valor Corrigido': correcao['valor_corrigido'],
+                            'Variação (%)': correcao['variacao_percentual']
+                        })
                         
                     except Exception as e:
-                        st.warning(f"Erro ao corrigir parcela {row['Parcela']}: {str(e)}")
-                        continue
+                        st.warning(f"Erro na parcela {row['Parcela']}: {str(e)}")
                 
                 if resultados:
                     df_resultados = pd.DataFrame(resultados)
                     
-                    st.subheader("Resultados da Correção")
+                    st.subheader("Resultados")
                     st.dataframe(df_resultados.style.format({
                         'Valor Original': format_currency,
-                        'Valor Recebido': format_currency,
                         'Valor Corrigido': format_currency,
-                        'Fator de Correção': "{:.6f}",
                         'Variação (%)': "{:.4f}%"
                     }))
                     
                     # Resumo
-                    st.subheader("Resumo Financeiro")
-                    col1, col2, col3 = st.columns(3)
-                    total_original = df_resultados['Valor Original'].sum()
-                    total_corrigido = df_resultados['Valor Corrigido'].sum()
-                    variacao = total_corrigido - total_original
-                    
-                    col1.metric("Total Original", format_currency(total_original))
-                    col2.metric("Total Corrigido", format_currency(total_corrigido))
-                    col3.metric("Variação Total", format_currency(variacao))
+                    st.subheader("Resumo")
+                    col1, col2 = st.columns(2)
+                    col1.metric("Total Original", format_currency(df_resultados['Valor Original'].sum()))
+                    col2.metric("Total Corrigido", format_currency(df_resultados['Valor Corrigido'].sum()))
                     
                     # Exportação
-                    st.subheader("Exportar Resultados")
-                    csv = df_resultados.to_csv(index=False).encode('utf-8')
                     st.download_button(
-                        "Baixar como CSV",
-                        data=csv,
-                        file_name="resultado_correcao.csv",
-                        mime="text/csv"
+                        "Exportar CSV",
+                        df_resultados.to_csv(index=False),
+                        "correcao_monetaria.csv",
+                        "text/csv"
                     )
                 else:
-                    st.error("Nenhum valor foi corrigido. Verifique os dados de entrada.")
+                    st.error("Nenhum cálculo foi realizado. Verifique os dados.")
                     
     except Exception as e:
-        st.error(f"Erro ao processar o arquivo: {str(e)}")
+        st.error(f"Falha no processamento: {str(e)}")
 
-# Rodapé
 st.markdown("---")
-st.markdown("Desenvolvido por Dev.Alli | Project - © 2025")
+st.markdown("Sistema de Correção Monetária")
