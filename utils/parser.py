@@ -1,11 +1,30 @@
 import pandas as pd
 import pdfplumber
 from datetime import datetime
-import re
+
+def extract_payment_data(uploaded_file):
+    """Extrai dados de parcelas de arquivos PDF ou Excel"""
+    if uploaded_file.name.endswith('.pdf'):
+        return extract_from_pdf(uploaded_file)
+    elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+        return extract_from_excel(uploaded_file)
+    else:
+        raise ValueError("Formato de arquivo não suportado")
 
 def extract_from_pdf(pdf_file):
-    """Extrai dados específicos do PDF com tratamento para formatos complexos"""
+    """Extrai dados específicos do PDF da Aquarela da Mata"""
     parcelas = []
+    
+    # Lista completa de prefixos com ponto
+    prefixos_com_ponto = [
+        'PR.', 'E.', 'P.', 'B.', 'BR.', 'SM.', '1.', 'ER.', '0.', '100.', '2.', '200.', '3.', 
+        'A.', 'ACF.', 'ADV.', 'AM.', 'AOD.', 'APS.', 'AT.', 'C.', 'CH.', 'CON.', 'CRE.', 'CUS.', 
+        'DE.', 'DEV.', 'DL.', 'DLT.', 'DVA.', 'EAP.', 'EMP.', 'GCC.', 'GRC.', 'IC.', 'ID.', 
+        'ISS.', 'ITA.', 'OP.', 'P1.', 'PAC.', 'PBC.', 'PC.', 'PD1.', 'PDT.', 'PE.', 'PG.', 
+        'PI.', 'PI1.', 'PM.', 'PM1.', 'PPS.', 'PQ.', 'PV.', 'R.', 'RC.', 'RCB.', 'RCC.', 
+        'RCH.', 'RCI.', 'RCP.', 'RD.', 'RDC.', 'RDI.', 'RFT.', 'RP.', 'RPI.', 'RPJ.', 'RPR.', 
+        'RRE.', 'RS.', 'RSD.', 'TC.', 'TR.', 'TRO.', 'UNM.', 'VA.', 'VME.', 'VTT.'
+    ]
     
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
@@ -16,85 +35,53 @@ def extract_from_pdf(pdf_file):
             header_found = False
             
             for line in lines:
-                # Verificação flexível de cabeçalho
+                # Verifica se é a linha de cabeçalho da tabela
                 if ("Parcela" in line and "Dt Vencim" in line and "Valor Parc." in line and 
                     "Dt. Receb." in line and "Vlr da Parcela" in line):
                     in_payment_table = True
                     header_found = True
                     continue
                 
-                # Processa linhas dentro da tabela
-                if in_payment_table and line.strip():
-                    # Padrão para identificar linhas de parcelas
-                    parcela_pattern = r'^([A-Z]\.\d+/\d+|P\.\d+/\d+|E\.\d+/\d+)'
-                    match = re.search(parcela_pattern, line.strip())
+                # Processa as linhas de dados que começam com qualquer prefixo válido
+                if in_payment_table and any(line.strip().startswith(prefix) for prefix in prefixos_com_ponto):
+                    # Remove múltiplos espaços e divide corretamente
+                    cleaned_line = ' '.join(line.split())
+                    parts = cleaned_line.split()
                     
-                    if match:
-                        cleaned_line = ' '.join(line.split())
-                        parts = cleaned_line.split()
+                    try:
+                        # Ajuste os índices conforme necessário para o seu PDF
+                        parcela_info = {
+                            'Parcela': parts[0],
+                            'Dt Vencim': parse_date(parts[1]),
+                            'Valor Parcela': parse_currency(parts[3]),
+                            'Dt Recebimento': parse_date(parts[4]),
+                            'Valor Recebido': parse_currency(parts[10] if len(parts) > 10 else '0'),
+                            'Status Pagamento': 'Pago' if len(parts) > 10 and parse_currency(parts[10]) > 0 else 'Pendente',
+                            'Arquivo Origem': pdf_file.name
+                        }
+                        parcelas.append(parcela_info)
                         
-                        try:
-                            # Extrai parcela
-                            parcela = parts[0]
-                            
-                            # Converte data de vencimento (formato DDMM/AAAA)
-                            dt_vencim_str = parts[1].replace('/', '')
-                            dt_vencim = datetime.strptime(dt_vencim_str[:2] + '/' + dt_vencim_str[2:4] + '/' + dt_vencim_str[4:], '%d/%m/%Y').date()
-                            
-                            # Extrai valor da parcela (trata diferentes formatos)
-                            valor_parc_str = parts[2].replace('.', '').replace(',', '.')
-                            valor_parcela = float(valor_parc_str)
-                            
-                            # Verifica se há data de recebimento
-                            dt_receb = None
-                            valor_recebido = 0.0
-                            
-                            if len(parts) > 3 and '/' in parts[3]:
-                                dt_receb_str = parts[3].replace('/', '')
-                                dt_receb = datetime.strptime(dt_receb_str[:2] + '/' + dt_receb_str[2:4] + '/' + dt_receb_str[4:], '%d/%m/%Y').date()
-                                
-                                if len(parts) > 4:
-                                    valor_receb_str = parts[4].replace('.', '').replace(',', '.')
-                                    valor_recebido = float(valor_receb_str)
-                            
-                            # Adiciona à lista de parcelas
-                            parcela_info = {
-                                'Parcela': parcela,
-                                'Dt Vencim': dt_vencim,
-                                'Valor Parcela': valor_parcela,
-                                'Dt Recebimento': dt_receb,
-                                'Valor Recebido': valor_recebido,
-                                'Status Pagamento': 'Pago' if valor_recebido > 0 else 'Pendente',
-                                'Arquivo Origem': pdf_file.name
-                            }
-                            parcelas.append(parcela_info)
-                            
-                        except (IndexError, ValueError, AttributeError) as e:
-                            print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
-                            continue
+                    except (IndexError, ValueError) as e:
+                        print(f"Erro ao processar linha: {line}. Erro: {str(e)}")
+                        continue
                 
                 # Finaliza quando encontrar o total
-                if in_payment_table and any(t in line for t in ["Total a pagar:", "TOTAL GERAL:"]):
+                if in_payment_table and ("Total a pagar:" in line or "TOTAL GERAL:" in line):
                     break
     
-    # Consolida múltiplos pagamentos para a mesma parcela
+    if not parcelas:
+        print("Nenhuma parcela encontrada. Linhas disponíveis:")
+        for i, line in enumerate(lines):
+            print(f"{i}: {line}")
+    
+    # Cria DataFrame e adiciona colunas calculadas
     df = pd.DataFrame(parcelas)
     if not df.empty:
-        # Agrupa por parcela e data de vencimento, somando os valores recebidos
-        df = df.groupby(['Parcela', 'Dt Vencim']).agg({
-            'Valor Parcela': 'first',
-            'Dt Recebimento': lambda x: x.dropna().iloc[0] if not x.dropna().empty else None,
-            'Valor Recebido': 'sum',
-            'Status Pagamento': lambda x: 'Pago' if any(s == 'Pago' for s in x) else 'Pendente',
-            'Arquivo Origem': 'first'
-        }).reset_index()
-        
-        # Calcula dias de atraso e valor pendente
-        df['Dias Atraso'] = df.apply(
-            lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days if x['Dt Recebimento'] and x['Dt Recebimento'] > x['Dt Vencim'] else 0,
+        df['Dias Atraso'] = (pd.to_datetime(df['Dt Recebimento']) - pd.to_datetime(df['Dt Vencim'])).dt.days
+        df['Valor Pendente'] = df.apply(
+            lambda x: x['Valor Parcela'] - x['Valor Recebido'] if x['Valor Recebido'] < x['Valor Parcela'] else 0,
             axis=1
         )
-        df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
     
     return df
 
