@@ -12,20 +12,6 @@ def extract_payment_data(file):
     else:
         raise ValueError("Formato de arquivo não suportado")
 
-import pandas as pd
-import pdfplumber
-from datetime import datetime
-import re
-
-def extract_payment_data(file):
-    """Função unificada para extrair dados de PDF ou Excel"""
-    if file.name.lower().endswith('.pdf'):
-        return extract_from_pdf(file)
-    elif file.name.lower().endswith(('.xls', '.xlsx')):
-        return extract_from_excel(file)
-    else:
-        raise ValueError("Formato de arquivo não suportado")
-
 def extract_from_pdf(pdf_file):
     """Extrai dados específicos do PDF com tratamento para formatos complexos"""
     parcelas = []
@@ -48,39 +34,39 @@ def extract_from_pdf(pdf_file):
                 
                 # Processa linhas dentro da tabela
                 if in_payment_table and line.strip():
-                    # Padrão melhorado para identificar prefixos variados (PR., BR., SM., etc.)
-                    parcela_pattern = r'^([A-Z]{1,3}\.\d+/\d+)'
+                    # Padrão melhorado para identificar prefixos variados (E., P., B., etc.)
+                    parcela_pattern = r'^([A-Z]\.\d+/\d+|B\.\d+/\d+)'
                     match = re.search(parcela_pattern, line.strip())
                     
                     if match:
-                        cleaned_line = ' '.join(line.split())
-                        parts = cleaned_line.split()
-                        
                         try:
+                            # Limpa e divide a linha mantendo os valores juntos
+                            cleaned_line = ' '.join(line.split())
+                            parts = re.split(r'\s{2,}', cleaned_line)  # Divide por múltiplos espaços
+                            
                             # Extrai parcela (mantém o formato original)
                             parcela = parts[0]
                             
-                            # Converte data de vencimento (formato DDMM/AAAA)
-                            dt_vencim_str = parts[1].replace('/', '')
-                            dt_vencim = datetime.strptime(dt_vencim_str[:2] + '/' + dt_vencim_str[2:4] + '/' + dt_vencim_str[4:], '%d/%m/%Y').date()
+                            # Converte data de vencimento (formato DD/MM/AAAA)
+                            dt_vencim = datetime.strptime(parts[1], '%d/%m/%Y').date()
                             
                             # Extrai valor da parcela (trata diferentes formatos)
                             valor_parc_str = parts[2].replace('.', '').replace(',', '.')
                             valor_parcela = float(valor_parc_str)
                             
-                            # Verifica se há data de recebimento
+                            # Verifica se há data de recebimento (pode estar vazia)
                             dt_receb = None
                             valor_recebido = 0.0
                             
                             if len(parts) > 3 and '/' in parts[3]:
-                                dt_receb_str = parts[3].replace('/', '')
-                                dt_receb = datetime.strptime(dt_receb_str[:2] + '/' + dt_receb_str[2:4] + '/' + dt_receb_str[4:], '%d/%m/%Y').date()
+                                dt_receb = datetime.strptime(parts[3], '%d/%m/%Y').date()
                                 
+                                # O valor recebido está na última coluna (Vlr da Parcela)
                                 if len(parts) > 4:
-                                    valor_receb_str = parts[4].replace('.', '').replace(',', '.')
+                                    valor_receb_str = parts[-1].replace('.', '').replace(',', '.')
                                     valor_recebido = float(valor_receb_str)
                             
-                            # Adiciona à lista de parcelas (mantém todas as entradas)
+                            # Adiciona à lista de parcelas
                             parcela_info = {
                                 'Parcela': parcela,
                                 'Dt Vencim': dt_vencim,
@@ -100,7 +86,7 @@ def extract_from_pdf(pdf_file):
                 if in_payment_table and any(t in line for t in ["Total a pagar:", "TOTAL GERAL:"]):
                     break
     
-    # Cria DataFrame sem agrupar (mantém todas as linhas originais)
+    # Cria DataFrame
     df = pd.DataFrame(parcelas)
     
     if not df.empty:
@@ -114,78 +100,6 @@ def extract_from_pdf(pdf_file):
         df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
     
     return df
-
-def parse_date(date_str):
-    """Converte string de data no formato DD/MM/YYYY para objeto date"""
-    try:
-        return datetime.strptime(date_str, '%d/%m/%Y').date()
-    except (ValueError, TypeError):
-        return None
-
-def parse_currency(value_str):
-    """Converte valores monetários com vírgula decimal para float"""
-    try:
-        cleaned_value = str(value_str).replace('R$', '').strip()
-        return float(cleaned_value.replace('.', '').replace(',', '.'))
-    except (ValueError, AttributeError):
-        return 0.0
-
-def extract_from_excel(excel_file):
-    """Extrai dados de arquivos Excel com estrutura similar"""
-    try:
-        df = pd.read_excel(excel_file, engine='openpyxl')
-        
-        # Mapeamento completo de colunas alternativas
-        col_mapping = {
-            'parcela': 'Parcela',
-            'numero parcela': 'Parcela',
-            'dt vencim': 'Dt Vencim',
-            'data vencimento': 'Dt Vencim',
-            'vencimento': 'Dt Vencim',
-            'valor parc': 'Valor Parcela',
-            'valor': 'Valor Parcela',
-            'valor parcela': 'Valor Parcela',
-            'dt receb': 'Dt Recebimento',
-            'data recebimento': 'Dt Recebimento',
-            'recebimento': 'Dt Recebimento',
-            'vlr parcela': 'Valor Recebido',
-            'valor recebido': 'Valor Recebido',
-            'vlr recebido': 'Valor Recebido',
-            'pagamento': 'Valor Recebido'
-        }
-        
-        # Normalizar nomes de colunas
-        df.columns = [col_mapping.get(col.lower().strip(), col) for col in df.columns]
-        
-        # Verificação robusta das colunas necessárias
-        required_columns = ['Parcela', 'Dt Vencim', 'Valor Parcela', 'Dt Recebimento', 'Valor Recebido']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            raise ValueError(f"Colunas obrigatórias não encontradas: {', '.join(missing_columns)}")
-        
-        # Conversão de tipos com tratamento de erros
-        date_columns = ['Dt Vencim', 'Dt Recebimento']
-        for col in date_columns:
-            df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce').dt.date
-        
-        currency_columns = ['Valor Parcela', 'Valor Recebido']
-        for col in currency_columns:
-            df[col] = df[col].apply(lambda x: parse_currency(str(x)) if pd.notna(x) else 0.0)
-        
-        # Adiciona colunas complementares
-        df['Status Pagamento'] = df.apply(
-            lambda x: 'Pago' if x['Valor Recebido'] > 0 else 'Pendente', 
-            axis=1
-        )
-        df['Dias Atraso'] = (pd.to_datetime(df['Dt Recebimento']) - pd.to_datetime(df['Dt Vencim'])).dt.days
-        df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
-        df['Arquivo Origem'] = excel_file.name
-        
-        return df[required_columns + ['Status Pagamento', 'Dias Atraso', 'Valor Pendente', 'Arquivo Origem']]
-    
-    except Exception as e:
-        raise ValueError(f"Erro ao processar arquivo Excel: {str(e)}")
 
 def parse_date(date_str):
     """Converte string de data no formato DD/MM/YYYY para objeto date"""
