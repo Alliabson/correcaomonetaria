@@ -1,122 +1,83 @@
-import pandas as pd
 import pdfplumber
+import pandas as pd
 from datetime import datetime
 import re
-import logging
-from typing import Union, Dict, List, Optional
+from typing import List, Dict, Optional
+import streamlit as st
 
-# Configuração de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def extract_pdf_data(pdf_file, selected_columns: List[str]) -> pd.DataFrame:
+    """Extrai dados de PDF com seleção de colunas"""
+    all_data = []
+    
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
 
-def extract_payment_data(file) -> pd.DataFrame:
-    """Função principal para extração de dados de arquivos PDF ou Excel"""
-    try:
-        if file.name.lower().endswith('.pdf'):
-            return extract_from_pdf(file)
-        elif file.name.lower().endswith(('.xls', '.xlsx')):
-            return extract_from_excel(file)
-        else:
-            raise ValueError("Formato de arquivo não suportado")
-    except Exception as e:
-        logger.error(f"Erro em extract_payment_data: {str(e)}")
-        raise
+            # Tenta extrair tabelas
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    for row in table:
+                        if len(row) >= 3:  # Mínimo de colunas
+                            parsed = parse_table_row(row, selected_columns)
+                            if parsed:
+                                all_data.append(parsed)
+            else:
+                # Fallback para extração por texto
+                lines = text.split('\n')
+                for line in lines:
+                    parsed = parse_text_line(line, selected_columns)
+                    if parsed:
+                        all_data.append(parsed)
 
-def extract_from_pdf(pdf_file) -> pd.DataFrame:
-    """Extrai dados de parcelas de PDFs com estrutura complexa"""
-    all_parcelas = []
-    
-    try:
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                
-                # Processa tanto tabelas quanto texto livre
-                table_data = extract_from_table(page)
-                text_data = extract_from_text(text)
-                
-                if table_data:
-                    all_parcelas.extend(table_data)
-                if text_data:
-                    all_parcelas.extend(text_data)
-        
-        df = create_dataframe(all_parcelas)
-        return df
-    
-    except Exception as e:
-        logger.error(f"Erro em extract_from_pdf: {str(e)}")
-        raise
+    return pd.DataFrame(all_data) if all_data else pd.DataFrame()
 
-def extract_from_table(page) -> List[Dict]:
-    """Extrai dados de tabelas no PDF"""
-    parcelas = []
-    
-    try:
-        # Tenta extrair tabelas usando pdfplumber
-        for table in page.extract_tables():
-            for row in table:
-                if len(row) >= 5:  # Número mínimo de colunas esperadas
-                    parcela_data = parse_table_row(row)
-                    if parcela_data:
-                        parcelas.append(parcela_data)
-    except Exception as e:
-        logger.warning(f"Erro ao extrair tabelas: {str(e)}")
-    
-    return parcelas
-
-def extract_from_text(text: str) -> List[Dict]:
-    """Extrai dados do texto livre do PDF"""
-    parcelas = []
-    lines = text.split('\n')
-    in_table = False
-    
-    for line in lines:
-        # Verifica início da tabela
-        if not in_table and ("Parcela" in line and "Dt Vencim" in line and "Valor Parc." in line):
-            in_table = True
-            continue
-        
-        if in_table:
-            # Verifica fim da tabela
-            if any(x in line for x in ["Total a pagar:", "TOTAL GERAL:", "Ano:"]):
-                break
-            
-            # Processa linha de parcela
-            parcela_data = parse_text_line(line)
-            if parcela_data:
-                parcelas.append(parcela_data)
-    
-    return parcelas
-
-def parse_table_row(row: List[str]) -> Optional[Dict]:
+def parse_table_row(row: List[str], selected_columns: List[str]) -> Optional[Dict]:
     """Processa uma linha de tabela do PDF"""
     try:
-        # Verifica se é uma linha válida
-        if not row[0] or not re.match(r'^[A-Z]{1,3}\.\d+/\d+', row[0].strip()):
-            return None
+        data = {}
         
-        return {
-            'Parcela': row[0].strip(),
-            'Dt Vencim': parse_date(row[1]),
-            'Valor Parcela': parse_currency(row[2]),
-            'Dt Recebimento': parse_date(row[3]),
-            'Valor Recebido': parse_currency(row[4]) if len(row) > 4 else 0,
-            'Correção': parse_currency(row[5]) if len(row) > 5 else 0,
-            'Multa': parse_currency(row[6]) if len(row) > 6 else 0,
-            'Juros Atr.': parse_currency(row[7]) if len(row) > 7 else 0,
-            'Desconto': parse_currency(row[8]) if len(row) > 8 else 0,
-            'Atraso': int(row[9]) if len(row) > 9 and row[9].isdigit() else 0
+        # Mapeamento básico de colunas (adaptar conforme seu PDF)
+        column_mapping = {
+            'Parcela': 0,
+            'Dt Vencim': 1,
+            'Valor Parc.': 2,
+            'Dt. Receb.': 3,
+            'Vlr da Parcela': 4,
+            'Correção': 5,
+            'Multa': 6,
+            'Juros Atr.': 7,
+            'Desconto': 8,
+            'Atraso': 9
         }
+        
+        for col in selected_columns:
+            idx = column_mapping.get(col, -1)
+            if idx < len(row) and idx >= 0:
+                value = row[idx].strip()
+                
+                # Conversão especial para alguns campos
+                if 'Dt' in col:
+                    data[col] = parse_date(value)
+                elif 'Valor' in col or 'Vlr' in col or 'Multa' in col or 'Juros' in col:
+                    data[col] = parse_currency(value)
+                elif 'Atraso' in col:
+                    data[col] = int(value) if value.isdigit() else 0
+                else:
+                    data[col] = value
+        
+        return data if data else None
+    
     except Exception as e:
-        logger.warning(f"Erro ao processar linha da tabela: {row}. Erro: {str(e)}")
+        st.warning(f"Erro ao processar linha: {row}\nErro: {str(e)}")
         return None
 
-def parse_text_line(line: str) -> Optional[Dict]:
+def parse_text_line(line: str, selected_columns: List[str]) -> Optional[Dict]:
     """Processa uma linha de texto do PDF"""
     try:
-        # Padrão para identificar parcelas (E.1/1, P.1/144, B.1/12, etc.)
+        # Padrão para identificar linhas de parcelas
         if not re.match(r'^[A-Z]{1,3}\.\d+/\d+', line.strip()):
             return None
         
@@ -124,130 +85,61 @@ def parse_text_line(line: str) -> Optional[Dict]:
         cleaned = re.sub(r'\s+', ' ', line.strip())
         parts = re.split(r'\s{2,}', cleaned)
         
-        # Extrai dados básicos
-        parcela = parts[0]
-        dt_vencim = parse_date(parts[1]) if len(parts) > 1 else None
-        valor_parc = parse_currency(parts[2]) if len(parts) > 2 else 0
+        data = {}
+        # Mapeamento simplificado (ajustar conforme necessário)
+        if len(parts) >= 3:
+            data['Parcela'] = parts[0]
+            data['Dt Vencim'] = parse_date(parts[1])
+            data['Valor Parc.'] = parse_currency(parts[2])
+            
+            if len(parts) >= 4 and 'Dt. Receb.' in selected_columns:
+                data['Dt. Receb.'] = parse_date(parts[3])
+            
+            if len(parts) >= 5 and 'Vlr da Parcela' in selected_columns:
+                data['Vlr da Parcela'] = parse_currency(parts[4])
         
-        # Encontra dados adicionais
-        dt_receb = None
-        valor_recebido = 0
-        correcao = 0
-        multa = 0
-        juros = 0
-        desconto = 0
-        atraso = 0
-        
-        for i, part in enumerate(parts):
-            if re.match(r'\d{2}/\d{2}/\d{4}', part):
-                dt_receb = parse_date(part)
-                if len(parts) > i+1:
-                    valor_recebido = parse_currency(parts[i+1])
-            
-            if 'Correção' in part or 'Corr.' in part:
-                correcao = parse_currency(parts[i+1] if len(parts) > i+1 else 0)
-            
-            if 'Multa' in part:
-                multa = parse_currency(parts[i+1] if len(parts) > i+1 else 0)
-            
-            if 'Juros' in part:
-                juros = parse_currency(parts[i+1] if len(parts) > i+1 else 0)
-            
-            if 'Desconto' in part:
-                desconto = parse_currency(parts[i+1] if len(parts) > i+1 else 0)
-            
-            if 'Atraso' in part and part.replace('Atraso', '').strip().isdigit():
-                atraso = int(part.replace('Atraso', '').strip())
-        
-        return {
-            'Parcela': parcela,
-            'Dt Vencim': dt_vencim,
-            'Valor Parcela': valor_parc,
-            'Dt Recebimento': dt_receb,
-            'Valor Recebido': valor_recebido,
-            'Correção': correcao,
-            'Multa': multa,
-            'Juros Atr.': juros,
-            'Desconto': desconto,
-            'Atraso': atraso
-        }
+        return {k: v for k, v in data.items() if k in selected_columns}
     
     except Exception as e:
-        logger.warning(f"Erro ao processar linha de texto: {line}. Erro: {str(e)}")
+        st.warning(f"Erro ao processar linha: {line}\nErro: {str(e)}")
         return None
-
-def create_dataframe(parcelas: List[Dict]) -> pd.DataFrame:
-    """Cria DataFrame com tratamento completo dos dados"""
-    if not parcelas:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(parcelas)
-    
-    # Calcula campos derivados
-    df['Dias Atraso'] = df.apply(
-        lambda x: (x['Dt Recebimento'] - x['Dt Vencim']).days 
-        if pd.notnull(x['Dt Recebimento']) and x['Dt Recebimento'] > x['Dt Vencim'] 
-        else 0,
-        axis=1
-    )
-    
-    df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
-    df['Status Pagamento'] = df.apply(
-        lambda x: 'Pago' if x['Valor Recebido'] > 0 else 'Pendente',
-        axis=1
-    )
-    
-    # Ordena por data de vencimento
-    if 'Dt Vencim' in df.columns:
-        df = df.sort_values('Dt Vencim')
-    
-    return df
 
 def parse_date(date_str: str) -> Optional[datetime.date]:
     """Converte string de data para objeto date"""
     try:
-        if not date_str or str(date_str).lower() == 'nan':
+        if not date_str:
             return None
-        
-        # Remove possíveis espaços ou caracteres estranhos
-        date_str = str(date_str).strip()
-        
-        # Tenta vários formatos de data
+            
         for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d'):
             try:
                 return datetime.strptime(date_str, fmt).date()
             except ValueError:
                 continue
-        
         return None
-    except Exception as e:
-        logger.warning(f"Erro ao converter data: {date_str}. Erro: {str(e)}")
+    except Exception:
         return None
 
 def parse_currency(value_str: str) -> float:
     """Converte valores monetários para float"""
     try:
-        if not value_str or str(value_str).lower() == 'nan':
+        if not value_str:
             return 0.0
-        
-        # Remove caracteres não numéricos (exceto vírgula e ponto)
+            
         cleaned = re.sub(r'[^\d.,]', '', str(value_str).strip())
         
-        # Verifica se tem vírgula como separador decimal
         if ',' in cleaned and '.' in cleaned:
             if cleaned.index(',') > cleaned.index('.'):  # 1.000,00
                 cleaned = cleaned.replace('.', '').replace(',', '.')
             else:  # 1,000.00
                 cleaned = cleaned.replace(',', '')
-        elif ',' in cleaned:  # 1,000 ou 1,00
+        elif ',' in cleaned:
             if len(cleaned.split(',')[-1]) == 2:  # 1,00 (centavos)
                 cleaned = cleaned.replace('.', '').replace(',', '.')
             else:  # 1,000
                 cleaned = cleaned.replace(',', '')
         
         return float(cleaned)
-    except Exception as e:
-        logger.warning(f"Erro ao converter valor monetário: {value_str}. Erro: {str(e)}")
+    except Exception:
         return 0.0
 
 def extract_from_excel(excel_file) -> pd.DataFrame:
