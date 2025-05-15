@@ -4,6 +4,9 @@ from datetime import datetime, date
 import pytz
 from utils.parser import extract_payment_data
 from utils.indices import *
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
