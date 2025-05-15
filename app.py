@@ -6,18 +6,30 @@ import os
 import sys
 from pathlib import Path
 
-# Configuração do path para garantir os imports
-current_dir = Path(__file__).parent
-sys.path.append(str(current_dir))
-
+# SOLUÇÃO DEFINITIVA PARA OS IMPORTS
 try:
+    # Tentativa 1: Importar normalmente
     from utils.parser import extract_payment_data
     from utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
-except ImportError as e:
-    st.error(f"Erro ao importar módulos necessários: {str(e)}")
-    st.error("Verifique se a pasta 'utils' está no mesmo diretório que app.py")
-    st.error(f"Path atual: {sys.path}")
-    st.stop()
+except ImportError:
+    try:
+        # Tentativa 2: Importar usando caminho absoluto
+        from .utils.parser import extract_payment_data
+        from .utils.indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
+    except ImportError:
+        try:
+            # Tentativa 3: Adicionar o diretório ao path
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            utils_path = os.path.join(current_dir, 'utils')
+            sys.path.append(utils_path)
+            
+            from parser import extract_payment_data
+            from indices import get_indices_disponiveis, calcular_correcao_individual, calcular_correcao_media
+        except ImportError as e:
+            st.error(f"Falha crítica ao importar módulos: {str(e)}")
+            st.error("Por favor, verifique se a pasta 'utils' está no local correto.")
+            st.error(f"Caminho atual: {os.path.abspath(__file__)}")
+            st.stop()
 
 # Função auxiliar para formatação de moeda
 def formatar_moeda(valor):
