@@ -30,6 +30,15 @@ except ImportError as e:
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária de Relatórios", layout="wide")
 
+def formatar_moeda(valor):
+    """Formata valores monetários para exibição"""
+    try:
+        if pd.isna(valor):
+            return "R$ 0,00"
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return "R$ 0,00"
+        
 # Título e descrição
 st.title("📈 Correção Monetária de Relatórios")
 st.markdown("""
