@@ -1,182 +1,218 @@
-import pandas as pd
 import pdfplumber
+import pandas as pd
 from datetime import datetime
 import re
-from typing import List, Dict
+from typing import Dict, List, Optional
+import locale
 
-def extract_payment_data(file):
-    """Função principal para extração de dados"""
-    if file.name.lower().endswith('.pdf'):
-        return extract_from_pdf(file)
-    elif file.name.lower().endswith(('.xls', '.xlsx')):
-        return extract_from_excel(file)
-    else:
-        raise ValueError("Formato de arquivo não suportado")
-
-def extract_from_pdf(pdf_file) -> Dict:
-    """Extrai dados do PDF e retorna estrutura com tabela e metadados"""
-    result = {
-        'raw_text': '',
-        'tables': [],
-        'columns': [],
-        'parcelas': []
-    }
-    
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            # Extrai texto bruto para análise
-            text = page.extract_text()
-            result['raw_text'] += text + "\n\n"
-            
-            # Extrai tabelas usando algoritmo otimizado
-            tables = page.extract_tables({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_y_tolerance": 10
-            })
-            
-            for table in tables:
-                if len(table) > 1:  # Ignora tabelas vazias
-                    result['tables'].append(table)
-                    
-                    # Identifica cabeçalhos
-                    if any("Parcela" in str(cell) for cell in table[0]):
-                        headers = [str(cell).strip() for cell in table[0]]
-                        result['columns'] = headers
-                        
-                        # Processa linhas de dados
-                        for row in table[1:]:
-                            if len(row) >= len(headers):
-                                parcela = {
-                                    'raw_data': row,
-                                    'processed': False
-                                }
-                                for i, header in enumerate(headers):
-                                    parcela[header] = row[i] if i < len(row) else None
-                                result['parcelas'].append(parcela)
-    
-    return result
-
-def process_extracted_data(raw_data: Dict, config: Dict) -> pd.DataFrame:
-    """Processa os dados extraídos conforme configuração"""
-    parcelas = []
-    
-    for parcela in raw_data['parcelas']:
+class PDFParser:
+    def __init__(self):
+        # Configura locale para formatação de valores
         try:
-            processed = {
-                'Parcela': parcela.get(config.get('col_parcela', 'Parcela'), ''),
-                'Dt Vencim': parse_date(parcela.get(config.get('col_dt_vencim', 'DI Veném Atraso'), '')),
-                'Valor Parcela': parse_currency(parcela.get(config.get('col_valor_parc', 'Valor Parc.'), '0')),
-                'Dt Recebimento': parse_date(parcela.get(config.get('col_dt_receb', 'Di. Receb.'), '')),
-                'Valor Recebido': parse_currency(parcela.get(config.get('col_valor_receb', 'Vir da Parcela'), '0')),
-                'Arquivo Origem': 'PDF'
-            }
-            
-            processed['Status Pagamento'] = 'Pago' if processed['Valor Recebido'] > 0 else 'Pendente'
-            processed['Dias Atraso'] = (processed['Dt Recebimento'] - processed['Dt Vencim']).days if processed['Dt Recebimento'] else 0
-            processed['Valor Pendente'] = processed['Valor Parcela'] - processed['Valor Recebido']
-            
-            parcelas.append(processed)
-            
-        except Exception as e:
-            print(f"Erro ao processar parcela: {parcela}. Erro: {str(e)}")
-            continue
-    
-    return pd.DataFrame(parcelas)
+            locale.setlocale(locale.LC_ALL, 'pt_BR.UTF-8')
+        except:
+            locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
 
-def parse_date(date_str):
-    """Converte string de data para objeto date"""
-    try:
-        date_str = str(date_str).strip()
-        if not date_str or date_str.lower() == 'nan':
-            return None
+    def extract_data(self, pdf_file) -> Dict:
+        """Extrai todos os dados do PDF de forma estruturada"""
+        result = {
+            'client_data': {},
+            'payment_data': [],
+            'yearly_totals': {},
+            'summary': {}
+        }
+
+        with pdfplumber.open(pdf_file) as pdf:
+            full_text = ""
+            
+            for page in pdf.pages:
+                # Extrai texto e tabelas de cada página
+                page_text = page.extract_text()
+                full_text += page_text + "\n\n"
+                
+                # Processa tabelas (se existirem)
+                tables = page.extract_tables({
+                    "vertical_strategy": "text", 
+                    "horizontal_strategy": "text",
+                    "intersection_y_tolerance": 10
+                })
+                
+                for table in tables:
+                    if len(table) > 1 and any("Parcela" in str(cell) for row in table for cell in row):
+                        self._process_table(table, result)
+
+            # Processa o texto completo para extrair informações adicionais
+            self._process_full_text(full_text, result)
+
+        return result
+
+    def _process_table(self, table: List[List[str]], result: Dict):
+        """Processa uma tabela encontrada no PDF"""
+        # Identifica cabeçalhos
+        headers = []
+        data_start = 0
         
-        # Tenta vários formatos de data
-        for fmt in ['%d%m/%Y', '%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d']:
-            try:
-                return datetime.strptime(date_str, fmt).date()
-            except ValueError:
+        for i, row in enumerate(table):
+            if any("Parcela" in str(cell) for cell in row):
+                headers = [str(cell).strip() for cell in row]
+                data_start = i + 1
+                break
+        
+        if not headers:
+            return
+
+        # Processa linhas de dados
+        for row in table[data_start:]:
+            if not row or len(row) < len(headers):
                 continue
-        return None
-    except:
-        return None
-
-def parse_currency(value_str):
-    """Converte valores monetários para float"""
-    try:
-        value_str = str(value_str).strip()
-        if not value_str or value_str.lower() == 'nan':
-            return 0.0
+                
+            payment = {}
+            for i, header in enumerate(headers):
+                if i >= len(row):
+                    continue
+                    
+                value = str(row[i]).strip()
+                
+                # Processa campos especiais
+                if "Data" in header or "Dt" in header or "Vencim" in header:
+                    payment[header] = self._parse_date(value)
+                elif "Valor" in header or "Vlr" in header or "Multa" in header or "Juros" in header:
+                    payment[header] = self._parse_currency(value)
+                else:
+                    payment[header] = value
             
-        # Remove caracteres não numéricos exceto vírgula e ponto
-        cleaned = re.sub(r'[^\d,.-]', '', value_str)
-        
-        # Caso tenha tanto ponto quanto vírgula (1.234,56)
-        if '.' in cleaned and ',' in cleaned:
-            cleaned = cleaned.replace('.', '').replace(',', '.')
-        # Caso tenha apenas vírgula (1234,56)
-        elif ',' in cleaned:
-            cleaned = cleaned.replace(',', '.')
-        
-        return float(cleaned)
-    except:
-        return 0.0
+            if payment:
+                result['payment_data'].append(payment)
 
-def extract_from_excel(excel_file):
-    """Extrai dados de arquivos Excel"""
-    try:
-        df = pd.read_excel(excel_file)
-        
-        # Mapeamento de colunas
-        col_map = {
-            'parcela': 'Parcela',
-            'numero_parcela': 'Parcela',
-            'vencimento': 'Dt Vencim',
-            'data_vencimento': 'Dt Vencim',
-            'valor': 'Valor Parcela',
-            'valor_parcela': 'Valor Parcela',
-            'recebimento': 'Dt Recebimento',
-            'data_recebimento': 'Dt Recebimento',
-            'valor_recebido': 'Valor Recebido',
-            'vlr_recebido': 'Valor Recebido'
+    def _process_full_text(self, text: str, result: Dict):
+        """Extrai informações adicionais do texto completo"""
+        # Extrai dados do cliente
+        client_data = {
+            'name': self._extract_value(text, 'Cliente :', 'Venda:'),
+            'contract_number': self._extract_value(text, 'Venda:', 'Dt. Venda:'),
+            'contract_date': self._extract_value(text, 'Dt. Venda:', 'Empreend.:'),
+            'project': self._extract_value(text, 'Empreend.:', 'End.:'),
+            'address': self._extract_value(text, 'End.:', 'Cidade :'),
+            'city': self._extract_value(text, 'Cidade :', 'UF :'),
+            'state': self._extract_value(text, 'UF :', 'CEP :'),
+            'zip_code': self._extract_value(text, 'CEP :', 'Fones:'),
+            'phone': self._extract_value(text, 'Fones:', 'Valor da venda:'),
+            'contract_value': self._extract_value(text, 'Valor da venda:', 'Status da venda:'),
+            'status': self._extract_value(text, 'Status da venda:', 'Titular')
+        }
+        result['client_data'] = client_data
+
+        # Extrai totais por ano
+        yearly_totals = {}
+        for year_match in re.finditer(r'Ano:\s*(\d{4}).*?Total pago:\s*([\d.,]+).*?Total a pagar:\s*([\d.,]+)', text, re.DOTALL):
+            year = year_match.group(1)
+            yearly_totals[year] = {
+                'paid': self._parse_currency(year_match.group(2)),
+                'to_pay': self._parse_currency(year_match.group(3))
+            }
+        result['yearly_totals'] = yearly_totals
+
+        # Extrai resumo financeiro
+        summary = {
+            'total_received': self._extract_value(text, 'RECEBIDO :', 'RECEBER'),
+            'total_to_receive': self._extract_value(text, 'RECEBER \+ RESID\. :', 'GERAL'),
+            'paid_percentage': self._extract_value(text, '% Recebida :', '% A Receber'),
+            'to_receive_percentage': self._extract_value(text, '% A Receber :', '\n')
+        }
+        result['summary'] = summary
+
+    def _extract_value(self, text: str, start_marker: str, end_marker: str) -> str:
+        """Extrai valor entre marcadores"""
+        start = re.search(start_marker, text)
+        if not start:
+            return ""
+            
+        end = re.search(end_marker, text[start.end():])
+        if not end:
+            return text[start.end():].strip()
+            
+        return text[start.end():start.end()+end.start()].strip()
+
+    def _parse_date(self, date_str: str) -> Optional[str]:
+        """Converte string de data para formato padronizado"""
+        try:
+            if not date_str or date_str.lower() == 'nan':
+                return None
+                
+            date_str = re.sub(r'[^\d/]', '', date_str)
+            
+            for fmt in ('%d/%m/%Y', '%d%m/%Y', '%Y-%m-%d'):
+                try:
+                    dt = datetime.strptime(date_str, fmt)
+                    return dt.strftime('%d/%m/%Y')
+                except ValueError:
+                    continue
+            return None
+        except:
+            return None
+
+    def _parse_currency(self, value_str: str) -> float:
+        """Converte valores monetários para float"""
+        try:
+            if not value_str:
+                return 0.0
+                
+            # Remove caracteres não numéricos exceto vírgula e ponto
+            cleaned = re.sub(r'[^\d,.-]', '', value_str)
+            
+            # Caso tenha tanto ponto quanto vírgula (1.234,56)
+            if '.' in cleaned and ',' in cleaned:
+                if cleaned.index(',') > cleaned.index('.'):  # 1.234,56
+                    cleaned = cleaned.replace('.', '').replace(',', '.')
+                else:  # 1,234.56
+                    cleaned = cleaned.replace(',', '')
+            # Caso tenha apenas vírgula (1234,56)
+            elif ',' in cleaned:
+                cleaned = cleaned.replace(',', '.')
+            
+            return float(cleaned)
+        except:
+            return 0.0
+
+    def to_dataframe(self, data: Dict) -> pd.DataFrame:
+        """Converte os dados extraídos para DataFrame"""
+        if not data.get('payment_data'):
+            return pd.DataFrame()
+            
+        # Padroniza nomes de colunas
+        column_mapping = {
+            'Parcela': 'installment',
+            'Dt Vencim': 'due_date',
+            'Valor Parc.': 'installment_value',
+            'Dt. Receb.': 'payment_date',
+            'Vlr da Parcela': 'total_value',
+            'Correção': 'correction',
+            'Multa': 'fine',
+            'Juros Atr.': 'interest',
+            'Desconto': 'discount',
+            'Atraso': 'days_late'
         }
         
-        # Normaliza nomes de colunas
-        df.columns = [col_map.get(col.lower().replace(' ', '_'), col) for col in df.columns]
+        # Cria DataFrame com os dados mapeados
+        df_data = []
+        for payment in data['payment_data']:
+            row = {}
+            for pdf_col, df_col in column_mapping.items():
+                if pdf_col in payment:
+                    row[df_col] = payment[pdf_col]
+            
+            # Calcula campos derivados
+            if 'due_date' in row and 'payment_date' in row:
+                try:
+                    due_date = datetime.strptime(row['due_date'], '%d/%m/%Y')
+                    pay_date = datetime.strptime(row['payment_date'], '%d/%m/%Y')
+                    row['days_late'] = (pay_date - due_date).days if pay_date > due_date else 0
+                except:
+                    row['days_late'] = 0
+            
+            if 'installment_value' in row and 'total_value' in row:
+                row['pending_value'] = row['installment_value'] - row['total_value']
+            
+            df_data.append(row)
         
-        # Converte datas
-        for col in ['Dt Vencim', 'Dt Recebimento']:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce').dt.date
-        
-        # Converte valores
-        for col in ['Valor Parcela', 'Valor Recebido']:
-            if col in df.columns:
-                df[col] = df[col].apply(parse_currency_specific)
-        
-        # Status de pagamento
-        df['Status Pagamento'] = df.apply(
-            lambda x: 'Pago' if pd.notna(x.get('Dt Recebimento')) and x.get('Valor Recebido', 0) > 0 
-            else 'Pendente', 
-            axis=1
-        )
-        
-        # Dias de atraso
-        if all(col in df.columns for col in ['Dt Recebimento', 'Dt Vencim']):
-            df['Dias Atraso'] = (pd.to_datetime(df['Dt Recebimento']) - pd.to_datetime(df['Dt Vencim'])).dt.days
-            df['Dias Atraso'] = df['Dias Atraso'].clip(lower=0)
-        else:
-            df['Dias Atraso'] = 0
-        
-        # Valor pendente
-        if all(col in df.columns for col in ['Valor Parcela', 'Valor Recebido']):
-            df['Valor Pendente'] = df['Valor Parcela'] - df['Valor Recebido']
-        else:
-            df['Valor Pendente'] = df['Valor Parcela']
-        
-        df['Arquivo Origem'] = excel_file.name
-        
-        return df
-        
-    except Exception as e:
-        raise ValueError(f"Erro ao processar Excel: {str(e)}")
+        return pd.DataFrame(df_data)
