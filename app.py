@@ -3,10 +3,16 @@ import pandas as pd
 from datetime import datetime
 from parser import extract_payment_data
 from utils.indices import *
+import pdfplumber
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
 st.title("📈 Sistema de Correção Monetária")
+
+def extract_payment_data(file):
+    """Função alternativa incorporada diretamente no app.py"""
+    with pdfplumber.open(file) as pdf:
+        text = "\n".join(page.extract_text() for page in pdf.pages)
 
 # Upload do arquivo
 uploaded_file = st.file_uploader("Carregue o arquivo PDF", type=["pdf"])
