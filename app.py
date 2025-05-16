@@ -585,6 +585,16 @@ def main():
         st.error("Erro de conexão com a API do Banco Central. Verifique sua conexão com a internet.")
     except Exception as e:
         st.error(f"Ocorreu um erro inesperado: {str(e)}")
-
+        
+    # Adicionar nota de rodapé
+    st.markdown(
+        """
+        <div style="text-align: right; margin-top: 50px; color: #666; font-size: 0.8em;">
+            Desenvolvido por Alliabson Lourenço @2025
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    
 if __name__ == "__main__":
     main()
