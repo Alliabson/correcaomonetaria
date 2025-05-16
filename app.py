@@ -2,6 +2,7 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
+import requests
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
 import base64
@@ -13,6 +14,14 @@ st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
 
 # Título do aplicativo
 st.title("📈 Correção Monetária Completa")
+
+# Importações do módulo de índices
+from utils.indices import (
+    get_indices_disponiveis,
+    calcular_correcao_individual,
+    calcular_correcao_media,
+    formatar_moeda
+)
 
 # ===== Classes para modelagem dos dados =====
 class Cliente:
@@ -45,9 +54,6 @@ class Parcela:
         }
 
 # ===== Funções de utilidade =====
-def formatar_moeda(valor: float) -> str:
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
 def parse_date(date_str: str) -> Optional[date]:
     try:
         return datetime.strptime(date_str, "%d/%m/%Y").date()
@@ -101,6 +107,9 @@ class PDFProcessor:
                 for page in pdf.pages:
                     full_text += page.extract_text() or ""
             
+            # Debug: Mostrar texto extraído (pode ser removido após testes)
+            st.text_area("Texto extraído do PDF (para debug)", full_text, height=200)
+            
             self._extract_cliente(full_text)
             self._extract_venda(full_text)
             self._extract_parcelas(full_text)
@@ -111,129 +120,109 @@ class PDFProcessor:
             return False
 
     def _extract_cliente(self, text: str):
+        # Padrão melhorado para cliente
         cliente_regex = r'Cliente\s*:\s*(\d+)\s*-\s*([^\n]+)'
         match = re.search(cliente_regex, text)
         if match:
-            self.cliente = Cliente(codigo=match.group(1), nome=match.group(2).strip())
+            self.cliente = Cliente(codigo=match.group(1).strip(), nome=match.group(2).strip())
+        else:
+            st.warning("Não foi possível extrair informações do cliente")
 
     def _extract_venda(self, text: str):
-        venda_regex = r'Venda:\s*(\d+)\s*Dt\.\s*Venda:\s*(\d{2}/\d{2}/\d{4})'
+        # Padrão melhorado para venda
+        venda_regex = r'Venda:\s*(\d+)\s+Dt\.?\s*Venda:\s*(\d{2}/\d{2}/\d{4})\s+Valor\s*da\s*venda:\s*([\d\.,]+)'
         match = re.search(venda_regex, text)
         if match:
-            valor_venda = self._extract_valor_venda(text)
             self.venda = Venda(
-                numero=match.group(1),
-                data=match.group(2),
-                valor=valor_venda
+                numero=match.group(1).strip(),
+                data=match.group(2).strip(),
+                valor=parse_monetary(match.group(3))
             )
-
-    def _extract_valor_venda(self, text: str) -> float:
-        regex = r'Valor da venda:\s*([\d\.,]+)'
-        match = re.search(regex, text)
-        return parse_monetary(match.group(1)) if match else 0.0
+        else:
+            st.warning("Não foi possível extrair informações da venda")
 
     def _extract_parcelas(self, text: str):
-        # Padrão corrigido para extrair todas as parcelas pagas
-        regex = r'([A-Z]\.\d+/\d+)\s+(\d{2}/\d{2}/\d{4})\s+\d*\s+([\d\.,]+)\s+(\d{2}/\d{2}/\d{4})\s+([\d\.,]+)\s+([\d\.,]*)\s+([\d\.,]*)\s+([\d\.,]*)\s+([\d\.,]*)\s+([\d\.,]*)'
+        # Padrão melhorado para extrair parcelas
+        padrao_parcela = (
+            r'([A-Z]?\.?\d+/\d+)\s+'  # Código da parcela (P.1/12, 1/12, etc)
+            r'(\d{2}/\d{2}/\d{4})\s+'  # Data de vencimento
+            r'(?:\d+\s+)?'  # Atraso (opcional)
+            r'([\d\.,]+)\s+'  # Valor original
+            r'(?:\d{2}/\d{2}/\d{4}\s+)?'  # Data de pagamento (opcional)
+            r'([\d\.,]*)'  # Valor pago
+        )
         
-        matches = re.finditer(regex, text)
+        # Encontrar todas as parcelas no texto
+        matches = re.finditer(padrao_parcela, text)
         self.parcelas = []
         
         for match in matches:
-            if match.group(4):  # Só inclui parcelas com data de recebimento
-                parcela = Parcela(
-                    codigo=match.group(1),
-                    data_vencimento=match.group(2),
-                    valor_original=parse_monetary(match.group(5)),  # Vlr. da Parcela
-                    data_recebimento=match.group(4),
-                    valor_pago=parse_monetary(match.group(3))  # Valor Parc. (valor pago)
-                )
-                self.parcelas.append(parcela)
+            codigo = match.group(1).strip()
+            # Ignorar linhas que são totais ou não são parcelas
+            if codigo.startswith('Total') or not any(c.isdigit() for c in codigo):
+                continue
+                
+            data_vencimento = match.group(2).strip()
+            valor_original = parse_monetary(match.group(3))
+            
+            # O valor pago pode estar em group 4 ou group 5 dependendo da estrutura
+            valor_pago_str = match.group(4) if match.group(4) else "0,00"
+            valor_pago = parse_monetary(valor_pago_str)
+            
+            # Tentar extrair data de pagamento (pode não estar presente)
+            data_pagamento = None
+            pagamento_match = re.search(
+                r'{}\s+{}\s+(?:\d+\s+)?[\d\.,]+\s+(\d{{2}}/\d{{2}}/\d{{4}})'.format(
+                    re.escape(codigo), re.escape(data_vencimento)
+                ), text
+            )
+            if pagamento_match:
+                data_pagamento = pagamento_match.group(1)
+            
+            parcela = Parcela(
+                codigo=codigo,
+                data_vencimento=data_vencimento,
+                valor_original=valor_original,
+                data_recebimento=data_pagamento,
+                valor_pago=valor_pago
+            )
+            self.parcelas.append(parcela)
+        
+        # Debug: Mostrar algumas parcelas extraídas
+        st.write(f"Parcelas extraídas: {len(self.parcelas)}")
+        for p in self.parcelas[:5]:  # Mostra as 5 primeiras para exemplo
+            st.write(p.to_dict())
+            
+        if not self.parcelas:
+            st.warning("Nenhuma parcela foi identificada no documento")
+
+        # Extrair totais do final do documento
+        total_recebido_match = re.search(
+            r'RECEBIDO\s*:\s*([\d\.,]+)\s+([\d\.,]+)',
+            text
+        )
+        if total_recebido_match:
+            self.total_recebido = parse_monetary(total_recebido_match.group(2))
+        
+        # O valor original total pode ser a soma de todas as parcelas
+        self.total_original = sum(p.valor_original for p in self.parcelas)
 
     def _calculate_totais(self):
         """Calcula totais recebidos e valor original"""
-        self.total_recebido = sum(p.valor_pago for p in self.parcelas if p.data_recebimento)
+        self.total_recebido = sum(p.valor_pago for p in self.parcelas)
         self.total_original = sum(p.valor_original for p in self.parcelas)
-
-# ===== Funções de Correção Monetária =====
-def get_indices_disponiveis() -> Dict[str, str]:
-    return {
-        "IGPM": "Índice Geral de Preços - Mercado",
-        "INPC": "Índice Nacional de Preços ao Consumidor",
-        "INCC": "Índice Nacional de Custo da Construção",
-        "IPCA": "Índice de Preços ao Consumidor Amplo"
-    }
-
-def get_indice_real(indice: str, data: date) -> float:
-    """Simulação mais realista dos índices"""
-    # Valores base mensais fictícios (em %)
-    indices_base = {
-        "IGPM": [0.82, 0.75, 0.68, 0.71, 0.79, 0.85, 0.90, 0.88, 0.83, 0.77, 0.72, 0.70],
-        "INPC": [0.48, 0.45, 0.42, 0.44, 0.47, 0.50, 0.53, 0.52, 0.49, 0.46, 0.43, 0.41],
-        "INCC": [0.65, 0.60, 0.55, 0.58, 0.63, 0.68, 0.72, 0.70, 0.66, 0.61, 0.57, 0.54],
-        "IPCA": [0.54, 0.51, 0.47, 0.49, 0.52, 0.56, 0.59, 0.57, 0.53, 0.50, 0.48, 0.45]
-    }
-    
-    # Variação anual fictícia
-    ano_fator = 1 + (data.year - 2020) * 0.05
-    mes_idx = data.month - 1
-    
-    return (indices_base.get(indice, [0.5]*12)[mes_idx] * ano_fator) / 100
-
-def calcular_correcao_individual(valor: float, data_origem: date, data_referencia: date, indice: str) -> Dict[str, float]:
-    """Calcula correção monetária usando um único índice"""
-    if data_origem >= data_referencia:
-        return {"valor_corrigido": valor, "fator_correcao": 1.0, "variacao_percentual": 0.0}
-    
-    fator = 1.0
-    data_atual = data_origem
-    
-    while data_atual < data_referencia:
-        variacao = get_indice_real(indice, data_atual)
-        fator *= (1 + variacao)
-        data_atual += relativedelta(months=1)
-    
-    valor_corrigido = valor * fator
-    variacao_percentual = (fator - 1) * 100
-    
-    return {
-        "valor_corrigido": valor_corrigido,
-        "fator_correcao": fator,
-        "variacao_percentual": variacao_percentual
-    }
-
-def calcular_correcao_media(valor: float, data_origem: date, data_referencia: date, indices: List[str]) -> Dict[str, float]:
-    """Calcula correção monetária usando média de vários índices"""
-    if data_origem >= data_referencia:
-        return {"valor_corrigido": valor, "fator_correcao": 1.0, "variacao_percentual": 0.0}
-    
-    fatores = []
-    
-    for indice in indices:
-        fator = 1.0
-        data_atual = data_origem
-        
-        while data_atual < data_referencia:
-            variacao = get_indice_real(indice, data_atual)
-            fator *= (1 + variacao)
-            data_atual += relativedelta(months=1)
-        
-        fatores.append(fator)
-    
-    fator_medio = sum(fatores) / len(fatores)
-    valor_corrigido = valor * fator_medio
-    variacao_percentual = (fator_medio - 1) * 100
-    
-    return {
-        "valor_corrigido": valor_corrigido,
-        "fator_correcao": fator_medio,
-        "variacao_percentual": variacao_percentual
-    }
 
 # ===== Interface do Usuário =====
 def render_sidebar():
     """Renderiza a barra lateral com configurações"""
     st.sidebar.header("Configurações de Correção")
+    
+    # Verificar índices disponíveis
+    indices_disponiveis = get_indices_disponiveis()
+    
+    if not indices_disponiveis:
+        st.sidebar.error("Nenhum índice econômico disponível no momento. Tente novamente mais tarde.")
+        return None
     
     # Modo de operação
     modo = st.sidebar.radio(
@@ -249,8 +238,6 @@ def render_sidebar():
         index=0
     )
     
-    indices_disponiveis = get_indices_disponiveis()
-    
     if metodo_correcao == "Índice Único":
         indice_selecionado = st.sidebar.selectbox(
             "Selecione o índice econômico",
@@ -262,9 +249,9 @@ def render_sidebar():
         indices_selecionados = st.sidebar.multiselect(
             "Selecione os índices para cálculo da média",
             options=list(indices_disponiveis.keys()),
-            default=["IGPM", "INPC", "INCC", "IPCA"]
+            default=list(indices_disponiveis.keys())
         )
-        indices_para_calculo = indices_selecionados if len(indices_selecionados) >= 2 else ["IGPM", "INPC", "INCC", "IPCA"]
+        indices_para_calculo = indices_selecionados if len(indices_selecionados) >= 2 else list(indices_disponiveis.keys())
         st.sidebar.info("Selecione pelo menos 2 índices para calcular a média.")
     
     # Data de referência para correção
@@ -313,20 +300,41 @@ def render_correcao_manual(config: Dict):
         st.warning("A data de referência deve ser posterior à data do valor")
         return
     
-    if config["metodo_correcao"] == "Índice Único":
-        correcao = calcular_correcao_individual(
-            config["valor_manual"],
-            config["data_manual"],
-            config["data_referencia"],
-            config["indices_para_calculo"][0]
-        )
-    else:
-        correcao = calcular_correcao_media(
-            config["valor_manual"],
-            config["data_manual"],
-            config["data_referencia"],
-            config["indices_para_calculo"]
-        )
+    with st.spinner("Calculando correção monetária..."):
+        if config["metodo_correcao"] == "Índice Único":
+            correcao = calcular_correcao_individual(
+                config["valor_manual"],
+                config["data_manual"],
+                config["data_referencia"],
+                config["indices_para_calculo"][0]
+            )
+            
+            if not correcao.get('sucesso', True):
+                st.error(correcao.get('mensagem', 'Erro ao calcular correção'))
+            
+            # Mostrar detalhes do índice
+            if 'detalhes' in correcao and not correcao['detalhes'].empty:
+                st.subheader(f"Detalhes do índice {config['indices_para_calculo'][0]}")
+                st.dataframe(correcao['detalhes'])
+        else:
+            correcao = calcular_correcao_media(
+                config["valor_manual"],
+                config["data_manual"],
+                config["data_referencia"],
+                config["indices_para_calculo"]
+            )
+            
+            if correcao.get('indices_falha'):
+                st.warning(f"Índices com problemas: {', '.join(correcao['indices_falha'])}")
+            
+            # Mostrar detalhes de cada índice
+            if 'resultados_parciais' in correcao:
+                for idx, resultado in enumerate(correcao['resultados_parciais']):
+                    if 'detalhes' in resultado and not resultado['detalhes'].empty:
+                        st.subheader(f"Detalhes do índice {resultado['indice']}")
+                        st.dataframe(resultado['detalhes'])
+                        if idx < len(correcao['resultados_parciais']) - 1:
+                            st.divider()
     
     col1, col2, col3 = st.columns(3)
     
@@ -334,9 +342,10 @@ def render_correcao_manual(config: Dict):
     col2.metric("Valor Corrigido", formatar_moeda(correcao["valor_corrigido"]))
     col3.metric("Variação", f"{correcao['variacao_percentual']:.2f}%")
     
-    st.write(f"**Índice(s) utilizado(s):** {', '.join(config['indices_para_calculo']) if config['metodo_correcao'] == 'Média de Índices' else config['indices_para_calculo'][0]}")
+    st.write(f"**Índice(s) utilizado(s):** {', '.join(correcao.get('indices', config['indices_para_calculo']))}")
     st.write(f"**Período:** {config['data_manual'].strftime('%d/%m/%Y')} a {config['data_referencia'].strftime('%d/%m/%Y')}")
     st.write(f"**Fator de correção:** {correcao['fator_correcao']:.6f}")
+
 def render_cliente_info(processor: PDFProcessor):
     """Renderiza informações do cliente"""
     st.subheader("Informações do Cliente")
@@ -381,44 +390,119 @@ def render_pdf_analysis(processor: PDFProcessor, config: Dict):
     
     # Botão para calcular correção
     st.divider()
-    if st.button("Calcular Correção Monetária", type="primary"):
+    if st.button("Calcular Correção Monetária", type="primary", key="btn_calcular_correcao"):
         # Lista para armazenar resultados
         resultados = []
+        detalhes_indices = []
         
-        for parcela in processor.parcelas:
+        progress_bar = st.progress(0)  # Barra de progresso
+        total_parcelas = len(processor.parcelas)
+        
+        for i, parcela in enumerate(processor.parcelas):
+            progress_bar.progress((i + 1) / total_parcelas)
+            
             valor_original = parcela.valor_original
+            valor_pago = parcela.valor_pago
             data_vencimento = parse_date(parcela.data_vencimento)
+            data_pagamento = parse_date(parcela.data_recebimento) if parcela.data_recebimento else None
             
             if not data_vencimento:
                 st.warning(f"Data de vencimento inválida para parcela {parcela.codigo}")
                 continue
             
             try:
+                # Correção do valor original
                 if config["metodo_correcao"] == "Índice Único":
-                    correcao = calcular_correcao_individual(
+                    correcao_original = calcular_correcao_individual(
                         valor_original,
                         data_vencimento,
                         config["data_referencia"],
                         config["indices_para_calculo"][0]
                     )
+                    if not correcao_original.get('sucesso', True):
+                        st.warning(f"Parcela {parcela.codigo}: {correcao_original.get('mensagem', 'Erro desconhecido')}")
+                    
+                    if 'detalhes' in correcao_original:
+                        detalhes_indices.append({
+                            'Parcela': parcela.codigo,
+                            'Tipo': 'Original',
+                            'Indice': config["indices_para_calculo"][0],
+                            'Detalhes': correcao_original['detalhes']
+                        })
                 else:
-                    correcao = calcular_correcao_media(
+                    correcao_original = calcular_correcao_media(
                         valor_original,
                         data_vencimento,
                         config["data_referencia"],
                         config["indices_para_calculo"]
                     )
+                    if correcao_original.get('indices_falha'):
+                        st.warning(f"Parcela {parcela.codigo}: Problemas com índices {', '.join(correcao_original['indices_falha'])}")
+                    
+                    if 'resultados_parciais' in correcao_original:
+                        for res in correcao_original['resultados_parciais']:
+                            if 'detalhes' in res:
+                                detalhes_indices.append({
+                                    'Parcela': parcela.codigo,
+                                    'Tipo': 'Original',
+                                    'Indice': res['indice'],
+                                    'Detalhes': res['detalhes']
+                                })
+                
+                # Correção do valor recebido (se houver data de pagamento)
+                correcao_recebido = None
+                if data_pagamento and valor_pago > 0:
+                    if config["metodo_correcao"] == "Índice Único":
+                        correcao_recebido = calcular_correcao_individual(
+                            valor_pago,
+                            data_pagamento,
+                            config["data_referencia"],
+                            config["indices_para_calculo"][0]
+                        )
+                        if not correcao_recebido.get('sucesso', True):
+                            st.warning(f"Parcela {parcela.codigo} (recebido): {correcao_recebido.get('mensagem', 'Erro desconhecido')}")
+                        
+                        if 'detalhes' in correcao_recebido:
+                            detalhes_indices.append({
+                                'Parcela': parcela.codigo,
+                                'Tipo': 'Recebido',
+                                'Indice': config["indices_para_calculo"][0],
+                                'Detalhes': correcao_recebido['detalhes']
+                            })
+                    else:
+                        correcao_recebido = calcular_correcao_media(
+                            valor_pago,
+                            data_pagamento,
+                            config["data_referencia"],
+                            config["indices_para_calculo"]
+                        )
+                        if correcao_recebido.get('indices_falha'):
+                            st.warning(f"Parcela {parcela.codigo} (recebido): Problemas com índices {', '.join(correcao_recebido['indices_falha'])}")
+                        
+                        if 'resultados_parciais' in correcao_recebido:
+                            for res in correcao_recebido['resultados_parciais']:
+                                if 'detalhes' in res:
+                                    detalhes_indices.append({
+                                        'Parcela': parcela.codigo,
+                                        'Tipo': 'Recebido',
+                                        'Indice': res['indice'],
+                                        'Detalhes': res['detalhes']
+                                    })
                 
                 # Adicionar ao dataframe de resultados
                 resultados.append({
                     'Parcela': parcela.codigo,
                     'Dt Vencim': parcela.data_vencimento,
+                    'Dt Receb': parcela.data_recebimento if parcela.data_recebimento else "",
                     'Valor Original': valor_original,
-                    'Valor Pago': parcela.valor_pago,
+                    'Valor Original Corrigido': correcao_original['valor_corrigido'],
+                    'Valor Pago': valor_pago,
+                    'Valor Pago Corrigido': correcao_recebido['valor_corrigido'] if correcao_recebido else 0.0,
                     'Índice(s)': ', '.join(config["indices_para_calculo"]) if config["metodo_correcao"] == "Média de Índices" else config["indices_para_calculo"][0],
-                    'Fator de Correção': correcao['fator_correcao'],
-                    'Variação (%)': correcao['variacao_percentual'],
-                    'Valor Corrigido': correcao['valor_corrigido']
+                    'Fator Correção Original': correcao_original['fator_correcao'],
+                    'Fator Correção Recebido': correcao_recebido['fator_correcao'] if correcao_recebido else 0.0,
+                    'Variação (%) Original': correcao_original['variacao_percentual'],
+                    'Variação (%) Recebido': correcao_recebido['variacao_percentual'] if correcao_recebido else 0.0
                 })
             
             except Exception as e:
@@ -433,23 +517,38 @@ def render_pdf_analysis(processor: PDFProcessor, config: Dict):
             st.subheader("Resultados da Correção Monetária")
             st.dataframe(df_resultados.style.format({
                 'Valor Original': formatar_moeda,
+                'Valor Original Corrigido': formatar_moeda,
                 'Valor Pago': formatar_moeda,
-                'Fator de Correção': "{:.6f}",
-                'Variação (%)': "{:.2f}%",
-                'Valor Corrigido': formatar_moeda
+                'Valor Pago Corrigido': formatar_moeda,
+                'Fator Correção Original': "{:.6f}",
+                'Fator Correção Recebido': "{:.6f}",
+                'Variação (%) Original': "{:.2f}%",
+                'Variação (%) Recebido': "{:.2f}%"
             }), use_container_width=True)
             
             # Resumo estatístico
             st.subheader("Resumo Estatístico")
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             
             total_original = df_resultados['Valor Original'].sum()
-            total_corrigido = df_resultados['Valor Corrigido'].sum()
-            variacao_total = total_corrigido - total_original
+            total_original_corrigido = df_resultados['Valor Original Corrigido'].sum()
+            total_recebido = df_resultados['Valor Pago'].sum()
+            total_recebido_corrigido = df_resultados['Valor Pago Corrigido'].sum()
             
-            col1.metric("Total Original", formatar_moeda(total_original))
-            col2.metric("Total Corrigido", formatar_moeda(total_corrigido))
-            col3.metric("Variação Total", formatar_moeda(variacao_total))
+            variacao_original = total_original_corrigido - total_original
+            variacao_recebido = total_recebido_corrigido - total_recebido
+            
+            col1.metric("Total Original", formatar_moeda(total_original), formatar_moeda(variacao_original))
+            col2.metric("Total Original Corrigido", formatar_moeda(total_original_corrigido))
+            col3.metric("Total Recebido", formatar_moeda(total_recebido), formatar_moeda(variacao_recebido))
+            col4.metric("Total Recebido Corrigido", formatar_moeda(total_recebido_corrigido))
+            
+            # Mostrar detalhes dos índices por parcela
+            if detalhes_indices:
+                st.subheader("Detalhes por Índice")
+                for detalhe in detalhes_indices[:5]:  # Mostrar apenas os primeiros para não sobrecarregar
+                    with st.expander(f"Detalhes para parcela {detalhe['Parcela']} - {detalhe['Tipo']} - {detalhe['Indice']}"):
+                        st.dataframe(detalhe['Detalhes'])
             
             # Opção para exportar resultados
             st.subheader("Exportar Resultados")
@@ -464,19 +563,28 @@ def render_pdf_analysis(processor: PDFProcessor, config: Dict):
 
 # ===== Aplicação principal =====
 def main():
-    # Configurações da barra lateral
-    config = render_sidebar()
-    
-    if config["modo"] == "Corrigir Valor Manual":
-        render_correcao_manual(config)
-    else:
-        # Upload do arquivo para modo PDF
-        uploaded_file = FileUploader()
+    try:
+        # Configurações da barra lateral
+        config = render_sidebar()
         
-        if uploaded_file is not None:
-            processor = PDFProcessor()
-            if processor.process_pdf(uploaded_file):
-                render_pdf_analysis(processor, config)
+        if not config:  # Se não há índices disponíveis
+            return
+            
+        if config["modo"] == "Corrigir Valor Manual":
+            render_correcao_manual(config)
+        else:
+            # Upload do arquivo para modo PDF
+            uploaded_file = FileUploader()
+            
+            if uploaded_file is not None:
+                processor = PDFProcessor()
+                if processor.process_pdf(uploaded_file):
+                    render_pdf_analysis(processor, config)
+    
+    except requests.exceptions.RequestException:
+        st.error("Erro de conexão com a API do Banco Central. Verifique sua conexão com a internet.")
+    except Exception as e:
+        st.error(f"Ocorreu um erro inesperado: {str(e)}")
 
 if __name__ == "__main__":
     main()
