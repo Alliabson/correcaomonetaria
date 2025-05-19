@@ -218,10 +218,16 @@ def render_sidebar():
     st.sidebar.header("Configurações de Correção")
     
     # Verificar índices disponíveis
-    indices_disponiveis = get_indices_disponiveis()
+    with st.spinner("Verificando disponibilidade dos índices..."):
+        indices_disponiveis = get_indices_disponiveis()
     
     if not indices_disponiveis:
-        st.sidebar.error("Nenhum índice econômico disponível no momento. Tente novamente mais tarde.")
+        st.sidebar.error("""
+        Não foi possível carregar os índices. Por favor:
+        1. Verifique sua conexão com a internet
+        2. Tente novamente em alguns minutos
+        3. Se o problema persistir, contate o suporte
+        """)
         return None
     
     # Modo de operação
@@ -585,16 +591,6 @@ def main():
         st.error("Erro de conexão com a API do Banco Central. Verifique sua conexão com a internet.")
     except Exception as e:
         st.error(f"Ocorreu um erro inesperado: {str(e)}")
-        
-    # Adicionar nota de rodapé
-    st.markdown(
-        """
-        <div style="text-align: right; margin-top: 50px; color: #666; font-size: 0.8em;">
-            Desenvolvido por Alliabson Lourenço @2025
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    
+
 if __name__ == "__main__":
     main()
