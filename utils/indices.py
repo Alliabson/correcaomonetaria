@@ -4,112 +4,353 @@ from datetime import datetime, date, timedelta
 import streamlit as st
 import concurrent.futures
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import json
+import socket
 
-# Códigos das séries no BCB (SGS) com fallbacks alternativos
-CODIGOS_INDICES = {
-    "IPCA": {"codigo": 433, "fallback": 1619},  # IPCA15 como fallback
-    "IGPM": {"codigo": 189, "fallback": None},
-    "INPC": {"codigo": 188, "fallback": None},
-    "INCC": {"codigo": 192, "fallback": 7458}  # INCC-DI como fallback
+# Configurações atualizadas das APIs
+API_CONFIG = {
+    "BCB": {
+        "base_url": "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados",
+        "timeout": 30
+    },
+    "IBGE": {
+        "base_url": "https://servicodados.ibge.gov.br/api/v3/agregados/{}/periodos/-{}/variaveis/63?localidades=N1[all]",
+        "timeout": 30,
+        "series": {
+            "IPCA": "1737",
+            "INPC": "1736"
+        }
+    }
 }
 
-@st.cache_data(ttl=3600, show_spinner="Buscando dados do Banco Central...")
-def fetch_bcb_data(series_code, start_date: date, end_date: date):
-    """Busca dados do Banco Central com tratamento robusto de falhas"""
-    base_url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados"
-    params = {
-        "formato": "json",
-        "dataInicial": start_date.strftime("%d/%m/%Y"),
-        "dataFinal": end_date.strftime("%d/%m/%Y")
+# Códigos atualizados das séries (verificados em agosto/2023)
+CODIGOS_INDICES = {
+    "IPCA": {
+        "codigo": 433,    # IPCA
+        "fallback": 1619, # IPCA-15
+        "api": ["BCB", "IBGE"]
+    },
+    "IGPM": {
+        "codigo": 189,    # IGP-M
+        "fallback": None,
+        "api": ["BCB"]
+    },
+    "INPC": {
+        "codigo": 188,    # INPC
+        "fallback": 11426, # INPC (série nova)
+        "api": ["BCB", "IBGE"]
+    },
+    "INCC": {
+        "codigo": 192,    # INCC
+        "fallback": 7458,  # INCC-DI
+        "api": ["BCB"]
     }
-    
-    attempts = 0
-    max_attempts = 3
-    retry_delay = 2  # segundos
-    
-    while attempts < max_attempts:
-        try:
-            response = requests.get(
-                base_url.format(series_code),
-                params=params,
-                timeout=30,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
+}
+
+@st.cache_data(ttl=3600, show_spinner="Buscando dados econômicos...")
+def fetch_api_data(api_name: str, series_code: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Busca dados de qualquer API com tratamento robusto de falhas"""
+    config = API_CONFIG.get(api_name)
+    if not config:
+        return pd.DataFrame()
+
+    try:
+        if api_name == "BCB":
+            # Tentativa 1: Sem filtro de data (mais estável)
+            try:
+                url = config["base_url"].format(series_code)
+                response = requests.get(url, params={"formato": "json"}, timeout=config["timeout"])
+                response.raise_for_status()
+                data = response.json()
+                
+                if data:
+                    df = pd.DataFrame(data)
+                    df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
+                    df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
+                    df = df.dropna()
+                    
+                    # Filtra localmente
+                    mask = (df['data'] >= start_date) & (df['data'] <= end_date)
+                    filtered_df = df[mask].copy()
+                    
+                    if not filtered_df.empty:
+                        return filtered_df
+            except:
+                pass
             
-            # Tratamento especial para erros 502
-            if response.status_code == 502 and attempts < max_attempts - 1:
-                st.warning(f"Serviço indisponível (502). Tentando novamente... ({attempts+1}/{max_attempts})")
-                time.sleep(retry_delay * (attempts + 1))  # Aumenta o delay a cada tentativa
-                attempts += 1
+            # Tentativa 2: Com filtro de data
+            try:
+                url = config["base_url"].format(series_code)
+                params = {
+                    "formato": "json",
+                    "dataInicial": start_date.strftime("%d/%m/%Y"),
+                    "dataFinal": end_date.strftime("%d/%m/%Y")
+                }
+                response = requests.get(url, params=params, timeout=config["timeout"])
+                response.raise_for_status()
+                data = response.json()
+                
+                if data:
+                    df = pd.DataFrame(data)
+                    df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
+                    df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
+                    return df.dropna()
+            except Exception as e:
+                st.error(f"Erro na API BCB: {str(e)}")
+            
+            return pd.DataFrame()
+
+        elif api_name == "IBGE":
+            # Nova API do IBGE (servicodados.ibge.gov.br)
+            if series_code not in config["series"]:
+                return pd.DataFrame()
+                
+            # Calcula o número de meses entre as datas
+            num_meses = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
+            periodo = f"{num_meses}%20meses" if num_meses > 1 else "1%20mes"
+            
+            url = config["base_url"].format(config["series"][series_code], periodo)
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=config["timeout"])
+                response.raise_for_status()
+                data = response.json()
+                
+                if not data or len(data) == 0:
+                    return pd.DataFrame()
+                    
+                # Processa a nova estrutura da API do IBGE
+                resultados = []
+                for item in data[0]['resultados'][0]['series'][0]['serie'].values():
+                    ano_mes = item['classificacoes'][0]['categoria']
+                    valor = item['variavel']['V']
+                    
+                    try:
+                        data_ref = datetime.strptime(ano_mes, "%Y%m").date()
+                        if start_date <= data_ref <= end_date:
+                            resultados.append({
+                                'data': data_ref,
+                                'valor': float(valor) / 100
+                            })
+                    except:
+                        continue
+                
+                if resultados:
+                    df = pd.DataFrame(resultados)
+                    return df.sort_values('data')
+                
+            except Exception as e:
+                st.error(f"Erro na API IBGE: {str(e)}")
+            
+            return pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Erro geral na API {api_name}: {str(e)}")
+        return pd.DataFrame()
+
+def get_indice_data(indice: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Obtém dados com estratégia de fallback aprimorada"""
+    config = CODIGOS_INDICES.get(indice)
+    if not config:
+        return pd.DataFrame()
+    
+    # 1. Tentativa: BCB com código principal
+    if "BCB" in config.get("api", []):
+        df = fetch_api_data("BCB", str(config["codigo"]), start_date, end_date)
+        if not df.empty:
+            return df
+            
+        # 2. Tentativa: BCB com fallback
+        if config["fallback"]:
+            df_fallback = fetch_api_data("BCB", str(config["fallback"]), start_date, end_date)
+            if not df_fallback.empty:
+                return df_fallback
+    
+    # 3. Tentativa: IBGE (para INPC e IPCA)
+    if indice in ["INPC", "IPCA"] and "IBGE" in config.get("api", []):
+        df_ibge = fetch_api_data("IBGE", indice, start_date, end_date)
+        if not df_ibge.empty:
+            return df_ibge
+    
+    return pd.DataFrame()
+
+def verificar_dados_inpc():
+    """Verifica a disponibilidade de dados do INPC"""
+    hoje = date.today()
+    ultimo_ano = date(hoje.year - 1, hoje.month, 1)
+    
+    st.write("### Verificação de dados do INPC")
+    
+    # Verifica BCB
+    try:
+        url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.188/dados"
+        params = {"formato": "json", "dataInicial": "01/01/2020", "dataFinal": hoje.strftime("%d/%m/%Y")}
+        response = requests.get(url, params=params, timeout=10)
+        data_bcb = response.json()
+        st.success(f"BCB: {len(data_bcb)} registros encontrados (último: {data_bcb[-1]['data'] if data_bcb else 'N/A'})")
+    except Exception as e:
+        st.error(f"Falha ao acessar BCB: {str(e)}")
+    
+    # Verifica IBGE
+    try:
+        url = "https://apisidra.ibge.gov.br/values/t/1736/n1/all/v/63/p/all/d/v63%202"
+        response = requests.get(url, timeout=10)
+        data_ibge = response.json()
+        st.success(f"IBGE: {len(data_ibge)-1} registros encontrados" if len(data_ibge) > 1 else "IBGE: Sem dados")
+    except Exception as e:
+        st.error(f"Falha ao acessar IBGE: {str(e)}")
+
+def verificar_conexao_internet():
+    """Verifica se há conexão com a internet"""
+    try:
+        requests.get("https://www.google.com", timeout=5)
+        return True
+    except:
+        return False
+@st.cache_data(ttl=3600)    
+def fetch_bcb_data(series_code: str, start_date: date, end_date: date, max_retries: int = 3) -> pd.DataFrame:
+    """Busca dados do BCB com tratamento de erros e retentativas"""
+    base_url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados"
+    
+    for attempt in range(max_retries):
+        try:
+            # Primeiro tenta sem filtro de datas (mais estável)
+            if attempt == 0:
+                url = base_url.format(series_code)
+                params = {"formato": "json"}
+            else:
+                # Nas tentativas seguintes, tenta com filtro de datas
+                url = base_url.format(series_code)
+                params = {
+                    "formato": "json",
+                    "dataInicial": start_date.strftime("%d/%m/%Y"),
+                    "dataFinal": end_date.strftime("%d/%m/%Y")
+                }
+            
+            response = requests.get(url, params=params, timeout=30)
+            
+            # Se for 502, espera um pouco e tenta novamente
+            if response.status_code == 502 and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Backoff exponencial
                 continue
                 
             response.raise_for_status()
-            
             data = response.json()
             
             if not data:
                 return pd.DataFrame()
                 
-            # Processamento dos dados
             df = pd.DataFrame(data)
             df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
-            df['valor'] = pd.to_numeric(df['valor']) / 100
-            return df[(df['data'] >= start_date) & (df['data'] <= end_date)]
+            df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
+            df = df.dropna()
             
+            # Filtra localmente se baixamos todos os dados
+            if 'dataInicial' not in params:
+                mask = (df['data'] >= start_date) & (df['data'] <= end_date)
+                df = df[mask].copy()
+            
+            return df
+
         except requests.exceptions.RequestException as e:
-            if attempts < max_attempts - 1:
-                st.warning(f"Erro na requisição ({type(e).__name__}). Tentando novamente... ({attempts+1}/{max_attempts})")
-                time.sleep(retry_delay * (attempts + 1))
-                attempts += 1
-            else:
-                st.error(f"Falha ao buscar dados: {str(e)}")
+            if attempt == max_retries - 1:
+                st.warning(f"Falha ao acessar BCB após {max_retries} tentativas: {str(e)}")
                 return pd.DataFrame()
+            time.sleep(2 ** attempt)
     
     return pd.DataFrame()
-
-def get_indice_data(indice: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """Obtém dados com fallback automático"""
-    config = CODIGOS_INDICES.get(indice)
-    if not config:
-        raise ValueError(f"Índice {indice} não configurado")
+def fetch_ibge_data(series_code: str) -> pd.DataFrame:
+    """Busca dados do IBGE com o novo endpoint"""
+    series_map = {
+        "INPC": "t/1736/n1/all/v/63/p/all/d/v63%202",
+        "IPCA": "t/1737/n1/all/v/63/p/all/d/v63%202"
+    }
     
-    # Tentativa com código principal
-    df = fetch_bcb_data(config["codigo"], start_date, end_date)
+    if series_code not in series_map:
+        return pd.DataFrame()
     
-    # Se falhou e tem fallback, tenta com fallback
-    if df.empty and config["fallback"]:
-        st.info(f"Usando série alternativa para {indice}...")
-        df = fetch_bcb_data(config["fallback"], start_date, end_date)
+    base_url = "https://apisidra.ibge.gov.br/values/"
+    url = base_url + series_map[series_code]
     
-    return df
-
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if len(data) < 2:
+            return pd.DataFrame()
+            
+        # Processamento dos dados
+        df = pd.DataFrame(data[1:], columns=data[0])
+        if 'D1C' not in df.columns or 'V' not in df.columns:
+            return pd.DataFrame()
+            
+        df = df[['D1C', 'V']].copy()
+        df['data'] = pd.to_datetime(df['D1C'], format='%Y%m', errors='coerce')
+        df['valor'] = pd.to_numeric(df['V'], errors='coerce') / 100
+        df = df.dropna()
+        df['data'] = df['data'].dt.date
+        
+        return df
+        
+    except Exception as e:
+        st.warning(f"Erro ao acessar IBGE: {str(e)}")
+        return pd.DataFrame()
 def verificar_disponibilidade_indices():
-    """Verifica quais índices estão disponíveis na API"""
+    """Verifica quais índices estão disponíveis na API com diagnósticos"""
     disponiveis = []
+    problemas = []
     hoje = date.today()
     teste_data = date(hoje.year - 1, hoje.month, hoje.day)
     
+    if not verificar_conexao_internet():
+        st.error("❌ Sem conexão com a internet")
+        return [], ["Sem conexão com a internet"]
+
     for indice, config in CODIGOS_INDICES.items():
         try:
-            # Tenta primeiro com código principal
-            dados = fetch_bcb_data(config["codigo"], teste_data, hoje)
-            
-            # Se falhou e tem fallback, tenta com fallback
-            if dados.empty and config["fallback"]:
-                dados = fetch_bcb_data(config["fallback"], teste_data, hoje)
-            
-            if not dados.empty:
+            df = get_indice_data(indice, teste_data, hoje)
+            if not df.empty:
                 disponiveis.append(indice)
-        except:
-            continue
+            else:
+                problemas.append(f"{indice} (Nenhum dado retornado)")
+        except Exception as e:
+            problemas.append(f"{indice} (Erro: {str(e)})")
     
-    return disponiveis
+    return disponiveis, problemas
 
 def get_indices_disponiveis():
     """Retorna os índices disponíveis com verificação em tempo real"""
-    disponiveis = verificar_disponibilidade_indices()
+    disponiveis, problemas = verificar_disponibilidade_indices()
     
+    if not disponiveis:
+        mensagem = """
+        Nenhum índice econômico disponível no momento.
+
+        🔍 Possíveis causas:
+        - Problemas nas APIs dos índices
+        - Sem conexão com a internet
+        - Códigos das séries desatualizados
+
+        📝 Detalhes técnicos:\n"""
+        
+        for problema in problemas:
+            mensagem += f"• {problema}\n"
+        
+        mensagem += "\n🛠️ Recomendações:\n"
+        mensagem += "- Verifique sua conexão com a internet\n"
+        mensagem += "- Tente novamente mais tarde\n"
+        mensagem += "- Contate o suporte técnico\n"
+        
+        st.error(mensagem)
+        return {}
+
     nomes = {
         "IPCA": "IPCA (IBGE/BCB)",
         "IGPM": "IGP-M (FGV/BCB)",
@@ -197,7 +438,6 @@ def fetch_multiple_indices(indices, start_date, end_date):
             if not config:
                 continue
                 
-            # Submete tanto o código principal quanto o fallback
             futures[executor.submit(get_indice_data, indice, start_date, end_date)] = indice
         
         results = {}
