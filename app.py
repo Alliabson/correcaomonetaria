@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import base64
 import pytz
 from dateutil.relativedelta import relativedelta
+from io import BytesIO
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
@@ -267,91 +268,157 @@ def render_sidebar():
         format="DD/MM/YYYY"
     )
     
-    # Campos para correção manual
-    valor_manual = None
-    data_manual = None
-    
-    if modo == "Corrigir Valor Manual":
-        valor_manual = st.sidebar.number_input(
-            "Valor a ser corrigido (R$)",
-            min_value=0.0,
-            value=155000.0,
-            step=1000.0
-        )
-        
-        data_manual = st.sidebar.date_input(
-            "Data do valor",
-            value=date(2025, 2, 18),
-            format="DD/MM/YYYY"
-        )
-    
     return {
         "modo": modo,
         "metodo_correcao": metodo_correcao,
         "indices_para_calculo": indices_para_calculo,
-        "data_referencia": data_referencia,
-        "valor_manual": valor_manual,
-        "data_manual": data_manual
+        "data_referencia": data_referencia
     }
 
 def render_correcao_manual(config: Dict):
-    """Renderiza a correção manual"""
+    """Renderiza a correção manual com capacidade de adicionar/remover parcelas"""
     st.subheader("Correção Monetária Manual")
     
-    if config["valor_manual"] <= 0:
-        st.warning("Informe um valor positivo para correção")
-        return
+    # Inicializar session_state se não existir
+    if "valores_manuais" not in st.session_state:
+        st.session_state.valores_manuais = []
     
-    if config["data_manual"] > config["data_referencia"]:
-        st.warning("A data de referência deve ser posterior à data do valor")
-        return
-    
-    with st.spinner("Calculando correção monetária..."):
-        if config["metodo_correcao"] == "Índice Único":
-            correcao = calcular_correcao_individual(
-                config["valor_manual"],
-                config["data_manual"],
-                config["data_referencia"],
-                config["indices_para_calculo"][0]
+    # Contêiner para adicionar novos valores
+    with st.expander("Adicionar Novo Valor para Correção", expanded=True):
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            novo_valor = st.number_input(
+                "Valor (R$)",
+                min_value=0.0,
+                value=1000.0,
+                step=100.0,
+                key="novo_valor"
             )
-            
-            if not correcao.get('sucesso', True):
-                st.error(correcao.get('mensagem', 'Erro ao calcular correção'))
-            
-            # Mostrar detalhes do índice
-            if 'detalhes' in correcao and not correcao['detalhes'].empty:
-                st.subheader(f"Detalhes do índice {config['indices_para_calculo'][0]}")
-                st.dataframe(correcao['detalhes'])
-        else:
-            correcao = calcular_correcao_media(
-                config["valor_manual"],
-                config["data_manual"],
-                config["data_referencia"],
-                config["indices_para_calculo"]
+        with col2:
+            nova_data = st.date_input(
+                "Data do valor",
+                value=date(2023, 1, 1),
+                format="DD/MM/YYYY",
+                key="nova_data"
             )
+        with col3:
+            st.write("")  # Espaçamento
+            st.write("")  # Espaçamento
+            if st.button("➕ Adicionar", key="btn_adicionar_valor"):
+                st.session_state.valores_manuais.append({
+                    "valor": novo_valor,
+                    "data": nova_data,
+                    "id": str(len(st.session_state.valores_manuais))  # ID único
+                })
+                st.rerun()
+    
+    # Mostrar valores adicionados com opção de remoção
+    if st.session_state.valores_manuais:
+        st.subheader("Valores para Correção")
+        
+        # Criar colunas para o layout
+        cols = st.columns([3, 2, 2, 1])
+        with cols[0]:
+            st.markdown("**Valor (R$)**")
+        with cols[1]:
+            st.markdown("**Data**")
+        with cols[2]:
+            st.markdown("**Ações**")
+        
+        # Lista para armazenar itens a serem removidos
+        to_remove = []
+        
+        for i, item in enumerate(st.session_state.valores_manuais):
+            cols = st.columns([3, 2, 2, 1])
             
-            if correcao.get('indices_falha'):
-                st.warning(f"Índices com problemas: {', '.join(correcao['indices_falha'])}")
+            with cols[0]:
+                st.markdown(f"R$ {item['valor']:,.2f}")
             
-            # Mostrar detalhes de cada índice
-            if 'resultados_parciais' in correcao:
-                for idx, resultado in enumerate(correcao['resultados_parciais']):
-                    if 'detalhes' in resultado and not resultado['detalhes'].empty:
-                        st.subheader(f"Detalhes do índice {resultado['indice']}")
-                        st.dataframe(resultado['detalhes'])
-                        if idx < len(correcao['resultados_parciais']) - 1:
-                            st.divider()
-    
-    col1, col2, col3 = st.columns(3)
-    
-    col1.metric("Valor Original", formatar_moeda(config["valor_manual"]))
-    col2.metric("Valor Corrigido", formatar_moeda(correcao["valor_corrigido"]))
-    col3.metric("Variação", f"{correcao['variacao_percentual']:.2f}%")
-    
-    st.write(f"**Índice(s) utilizado(s):** {', '.join(correcao.get('indices', config['indices_para_calculo']))}")
-    st.write(f"**Período:** {config['data_manual'].strftime('%d/%m/%Y')} a {config['data_referencia'].strftime('%d/%m/%Y')}")
-    st.write(f"**Fator de correção:** {correcao['fator_correcao']:.6f}")
-
+            with cols[1]:
+                st.markdown(item['data'].strftime("%d/%m/%Y"))
+            
+            with cols[2]:
+                if st.button(f"❌ Remover", key=f"remove_{item['id']}"):
+                    to_remove.append(i)
+        
+        # Processar remoções
+        if to_remove:
+            # Remover em ordem inversa para evitar problemas de índice
+            for i in sorted(to_remove, reverse=True):
+                if 0 <= i < len(st.session_state.valores_manuais):
+                    st.session_state.valores_manuais.pop(i)
+            st.rerun()
+        
+        # Calcular correção para todos os valores
+        if st.button("Calcular Correção para Todos", type="primary", key="btn_calcular_todos"):
+            resultados = []
+            
+            for item in st.session_state.valores_manuais:
+                valor = item["valor"]
+                data_valor = item["data"]
+                
+                if data_valor > config["data_referencia"]:
+                    st.warning(f"Data de referência deve ser posterior à data do valor {valor} (data: {data_valor.strftime('%d/%m/%Y')})")
+                    continue
+                
+                if config["metodo_correcao"] == "Índice Único":
+                    correcao = calcular_correcao_individual(
+                        valor,
+                        data_valor,
+                        config["data_referencia"],
+                        config["indices_para_calculo"][0]
+                    )
+                else:
+                    correcao = calcular_correcao_media(
+                        valor,
+                        data_valor,
+                        config["data_referencia"],
+                        config["indices_para_calculo"]
+                    )
+                
+                resultados.append({
+                    "Valor Original": valor,
+                    "Data Original": data_valor.strftime("%d/%m/%Y"),
+                    "Valor Corrigido": correcao["valor_corrigido"],
+                    "Índice(s)": ', '.join(correcao.get('indices', config['indices_para_calculo'])),
+                    "Fator de Correção": correcao["fator_correcao"],
+                    "Variação (%)": correcao["variacao_percentual"]
+                })
+            
+            if resultados:
+                df_resultados = pd.DataFrame(resultados)
+                
+                st.subheader("Resultados da Correção")
+                st.dataframe(df_resultados.style.format({
+                    "Valor Original": "R$ {:.2f}",
+                    "Valor Corrigido": "R$ {:.2f}",
+                    "Fator de Correção": "{:.6f}",
+                    "Variação (%)": "{:.2f}%"
+                }))
+                
+                # Opções de exportação
+                st.subheader("Exportar Resultados")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # CSV
+                    csv = df_resultados.to_csv(index=False)
+                    b64_csv = base64.b64encode(csv.encode()).decode()
+                    href_csv = f'<a href="data:file/csv;base64,{b64_csv}" download="correcao_manual.csv">Baixar como CSV</a>'
+                    st.markdown(href_csv, unsafe_allow_html=True)
+                
+                with col2:
+                    # Excel
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
+                    excel_data = output.getvalue()
+                    b64_xlsx = base64.b64encode(excel_data).decode()
+                    href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="correcao_manual.xlsx">Baixar como Excel</a>'
+                    st.markdown(href_xlsx, unsafe_allow_html=True)
+    else:
+        st.info("Adicione valores para correção usando o painel acima")
+        
 def render_cliente_info(processor: PDFProcessor):
     """Renderiza informações do cliente"""
     st.subheader("Informações do Cliente")
@@ -556,17 +623,29 @@ def render_pdf_analysis(processor: PDFProcessor, config: Dict):
                     with st.expander(f"Detalhes para parcela {detalhe['Parcela']} - {detalhe['Tipo']} - {detalhe['Indice']}"):
                         st.dataframe(detalhe['Detalhes'])
             
-            # Opção para exportar resultados
+            # Substitua a seção "Exportar Resultados" por:
             st.subheader("Exportar Resultados")
-            
-            # Criar link para download
-            csv = df_resultados.to_csv(index=False)
-            b64 = base64.b64encode(csv.encode()).decode()
-            href = f'<a href="data:file/csv;base64,{b64}" download="parcelas_corrigidas.csv">Baixar como CSV</a>'
-            st.markdown(href, unsafe_allow_html=True)
-        else:
-            st.warning("Nenhum resultado foi gerado")
 
+            # Criar botões lado a lado
+            col1, col2 = st.columns(2)
+
+            with col1:
+                # Exportar como CSV
+                csv = df_resultados.to_csv(index=False)
+                b64_csv = base64.b64encode(csv.encode()).decode()
+                href_csv = f'<a href="data:file/csv;base64,{b64_csv}" download="parcelas_corrigidas.csv">Baixar como CSV</a>'
+                st.markdown(href_csv, unsafe_allow_html=True)
+
+            with col2:
+                # Exportar como Excel
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
+                excel_data = output.getvalue()
+                b64_xlsx = base64.b64encode(excel_data).decode()
+                href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="parcelas_corrigidas.xlsx">Baixar como Excel</a>'
+                st.markdown(href_xlsx, unsafe_allow_html=True)
+                
 # ===== Aplicação principal =====
 def main():
     try:
