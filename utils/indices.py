@@ -7,6 +7,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 import json
 import socket
+from dateutil.relativedelta import relativedelta # Importação adicionada
 
 # Configurações atualizadas das APIs
 API_CONFIG = {
@@ -47,6 +48,9 @@ CODIGOS_INDICES = {
         "api": ["BCB"]
     }
 }
+
+# Lista de índices que usam o valor do mês anterior
+INDICES_COM_LAG = ["INCC", "IPCA", "INPC"]
 
 @st.cache_data(ttl=3600, show_spinner="Buscando dados econômicos...")
 def fetch_api_data(api_name: str, series_code: str, start_date: date, end_date: date) -> pd.DataFrame:
@@ -140,7 +144,7 @@ def fetch_api_data(api_name: str, series_code: str, start_date: date, end_date: 
                 if resultados:
                     df = pd.DataFrame(resultados)
                     return df.sort_values('data')
-                
+            
             except Exception as e:
                 st.error(f"Erro na API IBGE: {str(e)}")
             
@@ -365,7 +369,16 @@ def calcular_correcao_individual(valor_original, data_inicio: date, data_fim: da
     Calcula a correção individual com tratamento robusto de falhas
     Retorna um dicionário com todos os detalhes do cálculo
     """
-    if data_inicio >= data_fim:
+    # <<< INÍCIO DA ALTERAÇÃO >>>
+    # Ajusta as datas de busca para índices com defasagem de 1 mês
+    effective_start_date = data_inicio
+    effective_end_date = data_fim
+    if indice in INDICES_COM_LAG:
+        effective_start_date = data_inicio - relativedelta(months=1)
+        effective_end_date = data_fim - relativedelta(months=1)
+
+    if effective_start_date >= effective_end_date:
+    # <<< FIM DA ALTERAÇÃO >>>
         return {
             'indice': indice,
             'data_inicio': data_inicio.strftime("%m/%Y"),
@@ -380,7 +393,8 @@ def calcular_correcao_individual(valor_original, data_inicio: date, data_fim: da
         }
     
     try:
-        dados = get_indice_data(indice, data_inicio, data_fim)
+        # <<< ALTERAÇÃO: Usa as datas efetivas para buscar os dados >>>
+        dados = get_indice_data(indice, effective_start_date, effective_end_date)
         
         if dados.empty:
             return {
@@ -437,9 +451,18 @@ def fetch_multiple_indices(indices, start_date, end_date):
             config = CODIGOS_INDICES.get(indice)
             if not config:
                 continue
-                
-            futures[executor.submit(get_indice_data, indice, start_date, end_date)] = indice
-        
+            
+            # <<< INÍCIO DA ALTERAÇÃO >>>
+            # Ajusta as datas de busca para índices com defasagem
+            effective_start_date = start_date
+            effective_end_date = end_date
+            if indice in INDICES_COM_LAG:
+                effective_start_date = start_date - relativedelta(months=1)
+                effective_end_date = end_date - relativedelta(months=1)
+            
+            futures[executor.submit(get_indice_data, indice, effective_start_date, effective_end_date)] = indice
+            # <<< FIM DA ALTERAÇÃO >>>
+    
         results = {}
         for future in concurrent.futures.as_completed(futures):
             indice = futures[future]
@@ -471,7 +494,7 @@ def calcular_correcao_media(valor_original, data_inicio: date, data_fim: date, i
             'mensagem': 'Data de origem posterior à referência'
         }
     
-    # Busca todos os índices de uma vez (paralelizado)
+    # <<< ALTERAÇÃO: A lógica de ajuste de data foi movida para dentro de fetch_multiple_indices >>>
     dados_indices = fetch_multiple_indices(indices, data_inicio, data_fim)
     
     resultados = []
