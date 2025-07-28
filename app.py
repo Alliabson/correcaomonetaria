@@ -200,12 +200,12 @@ def render_sidebar():
         return None
     
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Regra Específica do IGPM")
+    st.sidebar.subheader("*Regra Específica de retroação para Debug*")
     igpm_retroacao = st.sidebar.radio(
-        "Retroação do IGPM",
+        "Retroagir",
         options=[0, 1],
         index=1,
-        format_func=lambda x: f"{x} mês(es) (Cestas/Casos Específicos)" if x==0 else f"{x} mês(es) (Padrão para Débitos)",
+        format_func=lambda x: f"{x} mês(es) (Debug Padrão)" if x==0 else f"{x} mês(es) (Debug específico)",
         help="Para corrigir débitos em um mês, use a retroação de 1 mês (pois o índice do mês corrente ainda não existe). Para cálculo de cestas ou casos onde o índice já está consolidado, pode-se usar 0."
     )
     st.sidebar.markdown("---")
