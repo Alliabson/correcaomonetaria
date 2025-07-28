@@ -19,16 +19,17 @@ def extract_from_pdf(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            if not text: continue
             lines = text.split('\n')
             
             for line in lines:
-                if line.strip().startswith('PR.'):  # Identifica linhas de parcelas
+                if line.startswith('PR.'):  # Identifica linhas de parcelas
                     parts = line.split()
                     
                     try:
+                        # Corrigir o parsing da data
                         data_vencimento = pd.to_datetime(parts[1], format='%d/%m/%Y').date()
                         
+                        # Corrigir o parsing do valor (tratando vírgula decimal)
                         valor_str = parts[2].replace('.', '').replace(',', '.')
                         valor = float(valor_str)
                         
@@ -50,22 +51,25 @@ def extract_from_excel(excel_file):
     """
     df = pd.read_excel(excel_file)
     
-    required_columns_map = {
-        'Parcela': ['parcela', 'parc.'],
-        'Dt Vencim': ['vencim', 'vencimento'],
-        'Valor Parcela': ['valor', 'valor parcela']
-    }
+    # Supondo que o Excel tenha colunas nomeadas de forma padrão
+    # Ajustar conforme o layout real do arquivo
+    required_columns = ['Parcela', 'Dt Vencim', 'Valor Parcela']
     
-    rename_dict = {}
-    for standard_col, possible_names in required_columns_map.items():
-        for col in df.columns:
-            if col.lower() in possible_names:
-                rename_dict[col] = standard_col
-                break
-    
-    df.rename(columns=rename_dict, inplace=True)
-    
-    if all(col in df.columns for col in required_columns_map.keys()):
-        return df[list(required_columns_map.keys())].copy()
+    # Verificar se as colunas necessárias existem
+    if all(col in df.columns for col in required_columns):
+        return df[required_columns].copy()
     else:
-        raise ValueError("Não foi possível identificar as colunas necessárias no arquivo Excel")
+        # Tentar identificar colunas automaticamente
+        # (implementação básica - melhorar conforme necessidade)
+        for col in df.columns:
+            if 'parcela' in col.lower():
+                df.rename(columns={col: 'Parcela'}, inplace=True)
+            elif 'vencim' in col.lower() or 'vencimento' in col.lower():
+                df.rename(columns={col: 'Dt Vencim'}, inplace=True)
+            elif 'valor' in col.lower() and 'parcela' in col.lower():
+                df.rename(columns={col: 'Valor Parcela'}, inplace=True)
+        
+        if all(col in df.columns for col in required_columns):
+            return df[required_columns].copy()
+        else:
+            raise ValueError("Não foi possível identificar as colunas necessárias no arquivo Excel")
