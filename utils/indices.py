@@ -281,7 +281,7 @@ def buscar_dados_ibge_sidra(api_config: dict, codigo: str, data_inicio: date, da
             try:
                 if len(linha) >= 2:
                     periodo_str = linha[0]  # Primeira coluna é o período
-                    valor_str = linha[1]   # Segunda coluna é o valor
+                    valor_str = linha[1]    # Segunda coluna é o valor
                     
                     if periodo_str and valor_str and len(periodo_str) == 6:
                         data_ref = datetime.strptime(periodo_str, "%Y%m").date()
@@ -354,6 +354,9 @@ def buscar_dados_indice(indice: str, data_inicio: date, data_final: date) -> pd.
     st.error(f"❌ Todas as fontes falharam para {indice}")
     return pd.DataFrame()
 
+# ===== INÍCIO DA CORREÇÃO =====
+@st.cache_data(ttl=3600) # Cacheia o resultado por 1 hora (3600 segundos)
+# ===== FIM DA CORREÇÃO =====
 def get_indices_disponiveis() -> Dict[str, dict]:
     """Verifica disponibilidade dos índices de forma inteligente"""
     hoje = date.today()
