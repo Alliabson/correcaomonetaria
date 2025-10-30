@@ -207,10 +207,14 @@ def render_sidebar():
     
     # Botão para limpar cache
     if st.sidebar.button("🗑️ Limpar Cache", help="Limpa dados em cache para forçar atualização"):
-        limpar_cache()
+        limpar_cache() # Limpa o cache do SQLite
+        # ===== INÍCIO DA CORREÇÃO =====
+        get_indices_disponiveis.clear() # Limpa o cache do Streamlit (@st.cache_data)
+        # ===== FIM DA CORREÇÃO =====
         st.rerun()
     
     # Verificar índices disponíveis
+    # Esta função agora usa o cache do Streamlit
     with st.sidebar.expander("📊 Status dos Índices", expanded=True):
         indices_disponiveis = get_indices_disponiveis()
     
@@ -248,33 +252,23 @@ def render_sidebar():
         )
         indices_para_calculo = [indice_selecionado]
     else:
-        # ===== INÍCIO DA CORREÇÃO =====
-        
         opcoes_indices = list(indices_disponiveis.keys())
         
-        # Inicializa o estado do multiselect (gerenciado pelo 'key')
-        # SE ele não existir ainda.
+        # Esta lógica agora funciona, pois `opcoes_indices` 
+        # estará cheia desde a primeira execução.
         if 'multiselect_indices' not in st.session_state:
             st.session_state.multiselect_indices = opcoes_indices
         
-        # O multiselect agora lê e escreve diretamente 
-        # em st.session_state.multiselect_indices.
         st.sidebar.multiselect(
             "Selecione os índices para cálculo da média",
             options=opcoes_indices,
             key="multiselect_indices"
-            # Não precisamos mais do 'default' aqui, pois o 'key' gerencia o estado.
         )
         
-        # A variável 'indices_para_calculo' lê o valor ATUAL do session_state
         indices_para_calculo = st.session_state.multiselect_indices
         
-        # A lógica de validação agora apenas avisa, 
-        # sem reverter a seleção do usuário.
         if len(indices_para_calculo) < 2:
             st.sidebar.warning("Selecione pelo menos 2 índices para calcular a média.")
-        
-        # ===== FIM DA CORREÇÃO =====
             
     # Data de referência para correção
     data_referencia = st.sidebar.date_input(
@@ -336,7 +330,6 @@ def render_correcao_manual(config: Dict):
         with cols[2]:
             st.markdown("**Ações**")
         
-        # CORREÇÃO: Usar formulário para evitar rerun desnecessário
         with st.form(key="form_remover_valores"):
             to_remove = []
             
@@ -350,11 +343,9 @@ def render_correcao_manual(config: Dict):
                     st.markdown(item['data'].strftime("%d/%m/%Y"))
                 
                 with cols[2]:
-                    # Usar checkbox em vez de botão para remoção
                     if st.checkbox(f"Remover", key=f"remove_{item['id']}"):
                         to_remove.append(i)
             
-            # Botão de submit único para todas as remoções
             if st.form_submit_button("✅ Confirmar Remoções", type="primary"):
                 if to_remove:
                     for i in sorted(to_remove, reverse=True):
@@ -363,7 +354,6 @@ def render_correcao_manual(config: Dict):
                     st.success(f"{len(to_remove)} valor(es) removido(s)!")
                     st.rerun()
         
-        # CORREÇÃO: Separar o botão de cálculo do formulário de remoção
         if st.button("🎯 Calcular Correção para Todos", type="primary", key="btn_calcular_todos"):
             with st.spinner("Calculando correções..."):
                 resultados = []
@@ -417,7 +407,6 @@ def render_correcao_manual(config: Dict):
                         "Variação (%)": "{:.2f}%"
                     }))
                     
-                    # Estatísticas resumidas
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric(
@@ -450,7 +439,7 @@ def render_correcao_manual(config: Dict):
                         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                             df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
                         excel_data = output.getvalue()
-                        b64_xlsx = base64.b64encode(excel_data).decode()
+                        b64_xlsx = base664.b64encode(excel_data).decode()
                         href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="correcao_manual.xlsx" style="background-color: #2196F3; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📊 Baixar Excel</a>'
                         st.markdown(href_xlsx, unsafe_allow_html=True)
                 else:
