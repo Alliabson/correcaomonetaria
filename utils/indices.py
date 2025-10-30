@@ -6,532 +6,529 @@ import concurrent.futures
 import time
 from typing import Dict, List, Optional, Tuple
 import json
-import socket
+import os
+import sqlite3
+from pathlib import Path
 
-# Configurações atualizadas das APIs
+# Configurações atualizadas com múltiplos endpoints
 API_CONFIG = {
-    "BCB": {
+    "BCB_PRIMARIO": {
         "base_url": "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados",
-        "timeout": 30
-    },
-    "IBGE": {
-        "base_url": "https://servicodados.ibge.gov.br/api/v3/agregados/{}/periodos/-{}/variaveis/63?localidades=N1[all]",
         "timeout": 30,
-        "series": {
-            "IPCA": "1737",
-            "INPC": "1736"
-        }
+        "prioridade": 1
+    },
+    "BCB_ALTERNATIVO": {
+        "base_url": "https://dados.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados",
+        "timeout": 30,
+        "prioridade": 2
+    },
+    "IBGE_NOVO": {
+        "base_url": "https://servicodados.ibge.gov.br/api/v3/agregados/{}/periodos/-{}%20meses/variaveis/63?localidades=N1[all]",
+        "timeout": 30,
+        "prioridade": 1
+    },
+    "IBGE_SIDRA": {
+        "base_url": "https://apisidra.ibge.gov.br/values/t/{}/n1/all/v/63/p/all/d/v63%202",
+        "timeout": 30,
+        "prioridade": 2
     }
 }
 
-# Códigos atualizados das séries (verificados em agosto/2023)
+# Múltiplas fontes para cada índice
 CODIGOS_INDICES = {
     "IPCA": {
-        "codigo": 433,    # IPCA
-        "fallback": 1619, # IPCA-15
-        "api": ["BCB", "IBGE"]
+        "fontes": [
+            {"api": "BCB_PRIMARIO", "codigo": "433"},
+            {"api": "BCB_ALTERNATIVO", "codigo": "433"},
+            {"api": "IBGE_NOVO", "codigo": "1737"},
+            {"api": "IBGE_SIDRA", "codigo": "1737"},
+            {"api": "BCB_PRIMARIO", "codigo": "1619"}  # IPCA-15 como fallback
+        ]
     },
     "IGPM": {
-        "codigo": 189,    # IGP-M
-        "fallback": None,
-        "api": ["BCB"]
+        "fontes": [
+            {"api": "BCB_PRIMARIO", "codigo": "189"},
+            {"api": "BCB_ALTERNATIVO", "codigo": "189"},
+            {"api": "BCB_PRIMARIO", "codigo": "190"}  # IGP-DI como fallback
+        ]
     },
     "INPC": {
-        "codigo": 188,    # INPC
-        "fallback": 11426, # INPC (série nova)
-        "api": ["BCB", "IBGE"]
+        "fontes": [
+            {"api": "BCB_PRIMARIO", "codigo": "188"},
+            {"api": "BCB_ALTERNATIVO", "codigo": "188"},
+            {"api": "IBGE_NOVO", "codigo": "1736"},
+            {"api": "IBGE_SIDRA", "codigo": "1736"},
+            {"api": "BCB_PRIMARIO", "codigo": "11426"}  # INPC série nova
+        ]
     },
     "INCC": {
-        "codigo": 192,    # INCC
-        "fallback": 7458,  # INCC-DI
-        "api": ["BCB"]
+        "fontes": [
+            {"api": "BCB_PRIMARIO", "codigo": "192"},
+            {"api": "BCB_ALTERNATIVO", "codigo": "192"},
+            {"api": "BCB_PRIMARIO", "codigo": "7458"}  # INCC-DI
+        ]
+    },
+    "SELIC": {
+        "fontes": [
+            {"api": "BCB_PRIMARIO", "codigo": "11"},
+            {"api": "BCB_ALTERNATIVO", "codigo": "11"},
+            {"api": "BCB_PRIMARIO", "codigo": "1178"}  # Meta Selic
+        ]
     }
 }
 
-@st.cache_data(ttl=3600, show_spinner="Buscando dados econômicos...")
-def fetch_api_data(api_name: str, series_code: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """Busca dados de qualquer API com tratamento robusto de falhas"""
-    config = API_CONFIG.get(api_name)
-    if not config:
-        return pd.DataFrame()
-
-    try:
-        if api_name == "BCB":
-            # Tentativa 1: Sem filtro de data (mais estável)
-            try:
-                url = config["base_url"].format(series_code)
-                response = requests.get(url, params={"formato": "json"}, timeout=config["timeout"])
-                response.raise_for_status()
-                data = response.json()
-                
-                if data:
-                    df = pd.DataFrame(data)
-                    df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
-                    df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
-                    df = df.dropna()
-                    
-                    # Filtra localmente
-                    mask = (df['data'] >= start_date) & (df['data'] <= end_date)
-                    filtered_df = df[mask].copy()
-                    
-                    if not filtered_df.empty:
-                        return filtered_df
-            except:
-                pass
-            
-            # Tentativa 2: Com filtro de data
-            try:
-                url = config["base_url"].format(series_code)
-                params = {
-                    "formato": "json",
-                    "dataInicial": start_date.strftime("%d/%m/%Y"),
-                    "dataFinal": end_date.strftime("%d/%m/%Y")
-                }
-                response = requests.get(url, params=params, timeout=config["timeout"])
-                response.raise_for_status()
-                data = response.json()
-                
-                if data:
-                    df = pd.DataFrame(data)
-                    df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
-                    df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
-                    return df.dropna()
-            except Exception as e:
-                st.error(f"Erro na API BCB: {str(e)}")
-            
-            return pd.DataFrame()
-
-        elif api_name == "IBGE":
-            # Nova API do IBGE (servicodados.ibge.gov.br)
-            if series_code not in config["series"]:
-                return pd.DataFrame()
-                
-            # Calcula o número de meses entre as datas
-            num_meses = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
-            periodo = f"{num_meses}%20meses" if num_meses > 1 else "1%20mes"
-            
-            url = config["base_url"].format(config["series"][series_code], periodo)
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            
-            try:
-                response = requests.get(url, headers=headers, timeout=config["timeout"])
-                response.raise_for_status()
-                data = response.json()
-                
-                if not data or len(data) == 0:
-                    return pd.DataFrame()
-                    
-                # Processa a nova estrutura da API do IBGE
-                resultados = []
-                for item in data[0]['resultados'][0]['series'][0]['serie'].values():
-                    ano_mes = item['classificacoes'][0]['categoria']
-                    valor = item['variavel']['V']
-                    
-                    try:
-                        data_ref = datetime.strptime(ano_mes, "%Y%m").date()
-                        if start_date <= data_ref <= end_date:
-                            resultados.append({
-                                'data': data_ref,
-                                'valor': float(valor) / 100
-                            })
-                    except:
-                        continue
-                
-                if resultados:
-                    df = pd.DataFrame(resultados)
-                    return df.sort_values('data')
-                
-            except Exception as e:
-                st.error(f"Erro na API IBGE: {str(e)}")
-            
-            return pd.DataFrame()
-
-    except Exception as e:
-        st.error(f"Erro geral na API {api_name}: {str(e)}")
-        return pd.DataFrame()
-
-def get_indice_data(indice: str, start_date: date, end_date: date) -> pd.DataFrame:
-    """Obtém dados com estratégia de fallback aprimorada"""
-    config = CODIGOS_INDICES.get(indice)
-    if not config:
-        return pd.DataFrame()
+# Sistema de cache com SQLite
+class CacheManager:
+    def __init__(self, db_path="indices_cache.db"):
+        self.db_path = db_path
+        self._init_db()
     
-    # 1. Tentativa: BCB com código principal
-    if "BCB" in config.get("api", []):
-        df = fetch_api_data("BCB", str(config["codigo"]), start_date, end_date)
-        if not df.empty:
-            return df
-            
-        # 2. Tentativa: BCB com fallback
-        if config["fallback"]:
-            df_fallback = fetch_api_data("BCB", str(config["fallback"]), start_date, end_date)
-            if not df_fallback.empty:
-                return df_fallback
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cache_indices (
+                chave TEXT PRIMARY KEY,
+                dados TEXT,
+                timestamp REAL,
+                expiracao REAL
+            )
+        ''')
+        conn.commit()
+        conn.close()
     
-    # 3. Tentativa: IBGE (para INPC e IPCA)
-    if indice in ["INPC", "IPCA"] and "IBGE" in config.get("api", []):
-        df_ibge = fetch_api_data("IBGE", indice, start_date, end_date)
-        if not df_ibge.empty:
-            return df_ibge
-    
-    return pd.DataFrame()
-
-def verificar_dados_inpc():
-    """Verifica a disponibilidade de dados do INPC"""
-    hoje = date.today()
-    ultimo_ano = date(hoje.year - 1, hoje.month, 1)
-    
-    st.write("### Verificação de dados do INPC")
-    
-    # Verifica BCB
-    try:
-        url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.188/dados"
-        params = {"formato": "json", "dataInicial": "01/01/2020", "dataFinal": hoje.strftime("%d/%m/%Y")}
-        response = requests.get(url, params=params, timeout=10)
-        data_bcb = response.json()
-        st.success(f"BCB: {len(data_bcb)} registros encontrados (último: {data_bcb[-1]['data'] if data_bcb else 'N/A'})")
-    except Exception as e:
-        st.error(f"Falha ao acessar BCB: {str(e)}")
-    
-    # Verifica IBGE
-    try:
-        url = "https://apisidra.ibge.gov.br/values/t/1736/n1/all/v/63/p/all/d/v63%202"
-        response = requests.get(url, timeout=10)
-        data_ibge = response.json()
-        st.success(f"IBGE: {len(data_ibge)-1} registros encontrados" if len(data_ibge) > 1 else "IBGE: Sem dados")
-    except Exception as e:
-        st.error(f"Falha ao acessar IBGE: {str(e)}")
-
-def verificar_conexao_internet():
-    """Verifica se há conexão com a internet"""
-    try:
-        requests.get("https://www.google.com", timeout=5)
-        return True
-    except:
-        return False
-@st.cache_data(ttl=3600)    
-def fetch_bcb_data(series_code: str, start_date: date, end_date: date, max_retries: int = 3) -> pd.DataFrame:
-    """Busca dados do BCB com tratamento de erros e retentativas"""
-    base_url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados"
-    
-    for attempt in range(max_retries):
+    def get(self, chave):
         try:
-            # Primeiro tenta sem filtro de datas (mais estável)
-            if attempt == 0:
-                url = base_url.format(series_code)
-                params = {"formato": "json"}
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT dados, timestamp, expiracao FROM cache_indices WHERE chave = ?",
+                (chave,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and time.time() < result[2]:
+                return json.loads(result[0])
+            return None
+        except:
+            return None
+    
+    def set(self, chave, dados, duracao_horas=24):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            timestamp = time.time()
+            expiracao = timestamp + (duracao_horas * 3600)
+            
+            cursor.execute(
+                '''INSERT OR REPLACE INTO cache_indices 
+                   (chave, dados, timestamp, expiracao) VALUES (?, ?, ?, ?)''',
+                (chave, json.dumps(dados), timestamp, expiracao)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except:
+            return False
+
+# Inicializar cache
+cache = CacheManager()
+
+def fazer_requisicao_robusta(url: str, params: dict = None, timeout: int = 30, max_retries: int = 3):
+    """Faz requisição com múltiplas tentativas e tratamento de erro"""
+    for tentativa in range(max_retries):
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
+            
+            response = requests.get(
+                url, 
+                params=params, 
+                headers=headers, 
+                timeout=timeout,
+                verify=True  # Importante para SSL
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code in [502, 503, 504]:
+                st.warning(f"Tentativa {tentativa + 1}: Servidor indisponível, aguardando...")
+                time.sleep(2 ** tentativa)  # Backoff exponencial
             else:
-                # Nas tentativas seguintes, tenta com filtro de datas
-                url = base_url.format(series_code)
-                params = {
-                    "formato": "json",
-                    "dataInicial": start_date.strftime("%d/%m/%Y"),
-                    "dataFinal": end_date.strftime("%d/%m/%Y")
-                }
-            
-            response = requests.get(url, params=params, timeout=30)
-            
-            # Se for 502, espera um pouco e tenta novamente
-            if response.status_code == 502 and attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Backoff exponencial
-                continue
+                st.warning(f"Tentativa {tentativa + 1}: HTTP {response.status_code}")
+                break
                 
-            response.raise_for_status()
-            data = response.json()
+        except requests.exceptions.Timeout:
+            st.warning(f"Tentativa {tentativa + 1}: Timeout")
+            if tentativa < max_retries - 1:
+                time.sleep(2 ** tentativa)
+        except requests.exceptions.ConnectionError:
+            st.warning(f"Tentativa {tentativa + 1}: Erro de conexão")
+            if tentativa < max_retries - 1:
+                time.sleep(2 ** tentativa)
+        except Exception as e:
+            st.warning(f"Tentativa {tentativa + 1}: {str(e)}")
+            break
+    
+    return None
+
+def buscar_dados_bcb(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Busca dados do BCB com estratégias alternativas"""
+    base_url = api_config["base_url"].format(codigo)
+    
+    # Estratégia 1: Sem filtro de data (mais estável)
+    dados = fazer_requisicao_robusta(base_url, {"formato": "json"}, api_config["timeout"])
+    
+    if dados:
+        try:
+            df = pd.DataFrame(dados)
+            df['data'] = pd.to_datetime(df['data'], dayfirst=True, errors='coerce').dt.date
+            df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
             
-            if not data:
-                return pd.DataFrame()
-                
-            df = pd.DataFrame(data)
-            df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
-            df['valor'] = pd.to_numeric(df['valor'], errors='coerce') / 100
+            # Converter para decimal se for porcentagem
+            if df['valor'].max() > 10:  # Assume que é porcentagem se valores > 10
+                df['valor'] = df['valor'] / 100
+            
             df = df.dropna()
             
-            # Filtra localmente se baixamos todos os dados
-            if 'dataInicial' not in params:
-                mask = (df['data'] >= start_date) & (df['data'] <= end_date)
-                df = df[mask].copy()
+            # Filtrar por período
+            mask = (df['data'] >= data_inicio) & (df['data'] <= data_final)
+            df_filtrado = df[mask].copy()
             
-            return df
-
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                st.warning(f"Falha ao acessar BCB após {max_retries} tentativas: {str(e)}")
-                return pd.DataFrame()
-            time.sleep(2 ** attempt)
+            if not df_filtrado.empty:
+                return df_filtrado
+        except Exception as e:
+            st.warning(f"Erro ao processar dados BCB: {str(e)}")
+    
+    # Estratégia 2: Com filtro de data
+    params = {
+        "formato": "json",
+        "dataInicial": data_inicio.strftime("%d/%m/%Y"),
+        "dataFinal": data_final.strftime("%d/%m/%Y")
+    }
+    
+    dados = fazer_requisicao_robusta(base_url, params, api_config["timeout"])
+    
+    if dados:
+        try:
+            df = pd.DataFrame(dados)
+            df['data'] = pd.to_datetime(df['data'], dayfirst=True, errors='coerce').dt.date
+            df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
+            
+            if df['valor'].max() > 10:
+                df['valor'] = df['valor'] / 100
+            
+            return df.dropna()
+        except Exception as e:
+            st.warning(f"Erro ao processar dados BCB filtrados: {str(e)}")
     
     return pd.DataFrame()
-def fetch_ibge_data(series_code: str) -> pd.DataFrame:
-    """Busca dados do IBGE com o novo endpoint"""
-    series_map = {
-        "INPC": "t/1736/n1/all/v/63/p/all/d/v63%202",
-        "IPCA": "t/1737/n1/all/v/63/p/all/d/v63%202"
-    }
-    
-    if series_code not in series_map:
-        return pd.DataFrame()
-    
-    base_url = "https://apisidra.ibge.gov.br/values/"
-    url = base_url + series_map[series_code]
-    
+
+def buscar_dados_ibge_novo(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Busca dados da nova API do IBGE"""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        # Calcular número de meses
+        meses_diff = (data_final.year - data_inicio.year) * 12 + data_final.month - data_inicio.month + 1
+        periodo = f"{meses_diff}" if meses_diff > 1 else "1"
         
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        url = api_config["base_url"].format(codigo, periodo)
+        dados = fazer_requisicao_robusta(url, timeout=api_config["timeout"])
         
-        if len(data) < 2:
+        if not dados or len(dados) == 0:
             return pd.DataFrame()
-            
-        # Processamento dos dados
-        df = pd.DataFrame(data[1:], columns=data[0])
-        if 'D1C' not in df.columns or 'V' not in df.columns:
-            return pd.DataFrame()
-            
-        df = df[['D1C', 'V']].copy()
-        df['data'] = pd.to_datetime(df['D1C'], format='%Y%m', errors='coerce')
-        df['valor'] = pd.to_numeric(df['V'], errors='coerce') / 100
-        df = df.dropna()
-        df['data'] = df['data'].dt.date
         
-        return df
+        # Processar estrutura complexa do IBGE
+        resultados = []
+        for item in dados:
+            for resultado in item.get('resultados', []):
+                for serie in resultado.get('series', []):
+                    for periodo_str, valores in serie.get('serie', {}).items():
+                        try:
+                            if len(periodo_str) == 6:  # Formato YYYYMM
+                                data_ref = datetime.strptime(periodo_str, "%Y%m").date()
+                                if data_inicio <= data_ref <= data_final:
+                                    valor = float(valores.get('V', 0))
+                                    resultados.append({
+                                        'data': data_ref,
+                                        'valor': valor / 100  # Converter para decimal
+                                    })
+                        except:
+                            continue
         
+        if resultados:
+            return pd.DataFrame(resultados).sort_values('data')
+            
     except Exception as e:
-        st.warning(f"Erro ao acessar IBGE: {str(e)}")
-        return pd.DataFrame()
-def verificar_disponibilidade_indices():
-    """Verifica quais índices estão disponíveis na API com diagnósticos"""
-    disponiveis = []
-    problemas = []
-    hoje = date.today()
-    teste_data = date(hoje.year - 1, hoje.month, hoje.day)
+        st.warning(f"Erro API IBGE nova: {str(e)}")
     
-    if not verificar_conexao_internet():
-        st.error("❌ Sem conexão com a internet")
-        return [], ["Sem conexão com a internet"]
+    return pd.DataFrame()
 
-    for indice, config in CODIGOS_INDICES.items():
-        try:
-            df = get_indice_data(indice, teste_data, hoje)
-            if not df.empty:
-                disponiveis.append(indice)
-            else:
-                problemas.append(f"{indice} (Nenhum dado retornado)")
-        except Exception as e:
-            problemas.append(f"{indice} (Erro: {str(e)})")
-    
-    return disponiveis, problemas
-
-def get_indices_disponiveis():
-    """Retorna os índices disponíveis com verificação em tempo real"""
-    disponiveis, problemas = verificar_disponibilidade_indices()
-    
-    if not disponiveis:
-        mensagem = """
-        Nenhum índice econômico disponível no momento.
-
-        🔍 Possíveis causas:
-        - Problemas nas APIs dos índices
-        - Sem conexão com a internet
-        - Códigos das séries desatualizados
-
-        📝 Detalhes técnicos:\n"""
-        
-        for problema in problemas:
-            mensagem += f"• {problema}\n"
-        
-        mensagem += "\n🛠️ Recomendações:\n"
-        mensagem += "- Verifique sua conexão com a internet\n"
-        mensagem += "- Tente novamente mais tarde\n"
-        mensagem += "- Contate o suporte técnico\n"
-        
-        st.error(mensagem)
-        return {}
-
-    nomes = {
-        "IPCA": "IPCA (IBGE/BCB)",
-        "IGPM": "IGP-M (FGV/BCB)",
-        "INPC": "INPC (IBGE/BCB)",
-        "INCC": "INCC (FGV/BCB)"
-    }
-    
-    return {k: v for k, v in nomes.items() if k in disponiveis}
-
-def calcular_correcao_individual(valor_original, data_inicio: date, data_fim: date, indice: str):
-    """
-    Calcula a correção individual com tratamento robusto de falhas
-    Retorna um dicionário com todos os detalhes do cálculo
-    """
-    if data_inicio >= data_fim:
-        return {
-            'indice': indice,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
-            'fator_correcao': 1.0,
-            'variacao_percentual': 0.0,
-            'valor_corrigido': valor_original,
-            'detalhes': pd.DataFrame(),
-            'sucesso': True,
-            'mensagem': 'Data de origem posterior à referência'
-        }
-    
+def buscar_dados_ibge_sidra(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Busca dados do SIDRA tradicional"""
     try:
-        dados = get_indice_data(indice, data_inicio, data_fim)
+        url = api_config["base_url"].format(codigo)
+        dados = fazer_requisicao_robusta(url, timeout=api_config["timeout"])
         
-        if dados.empty:
-            return {
-                'indice': indice,
-                'data_inicio': data_inicio.strftime("%m/%Y"),
-                'data_fim': data_fim.strftime("%m/%Y"),
-                'valor_original': valor_original,
-                'fator_correcao': 1.0,
-                'variacao_percentual': 0.0,
-                'valor_corrigido': valor_original,
-                'detalhes': pd.DataFrame(),
-                'sucesso': False,
-                'mensagem': f'Não foram encontrados dados para {indice} no período'
-            }
+        if not dados or len(dados) < 2:
+            return pd.DataFrame()
         
-        # Calcular variação acumulada
-        fator_correcao = (1 + dados['valor']).prod()
-        variacao_percentual = (fator_correcao - 1) * 100
-        valor_corrigido = valor_original * fator_correcao
-        
-        return {
-            'indice': indice,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
-            'fator_correcao': fator_correcao,
-            'variacao_percentual': variacao_percentual,
-            'valor_corrigido': valor_corrigido,
-            'detalhes': dados,
-            'sucesso': True,
-            'mensagem': 'Cálculo realizado com sucesso'
-        }
-    
-    except Exception as e:
-        return {
-            'indice': indice,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
-            'fator_correcao': 1.0,
-            'variacao_percentual': 0.0,
-            'valor_corrigido': valor_original,
-            'detalhes': pd.DataFrame(),
-            'sucesso': False,
-            'mensagem': f'Erro ao calcular correção com {indice}: {str(e)}'
-        }
-
-def fetch_multiple_indices(indices, start_date, end_date):
-    """Busca dados de vários índices simultaneamente"""
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = {}
-        
-        for indice in indices:
-            config = CODIGOS_INDICES.get(indice)
-            if not config:
+        # Processar dados do SIDRA
+        resultados = []
+        for linha in dados[1:]:
+            try:
+                if len(linha) >= 2:
+                    periodo_str = linha[0]  # Primeira coluna é o período
+                    valor_str = linha[1]   # Segunda coluna é o valor
+                    
+                    if periodo_str and valor_str and len(periodo_str) == 6:
+                        data_ref = datetime.strptime(periodo_str, "%Y%m").date()
+                        if data_inicio <= data_ref <= data_final:
+                            valor = float(valor_str)
+                            resultados.append({
+                                'data': data_ref,
+                                'valor': valor / 100
+                            })
+            except:
                 continue
-                
-            futures[executor.submit(get_indice_data, indice, start_date, end_date)] = indice
         
-        results = {}
+        if resultados:
+            return pd.DataFrame(resultados).sort_values('data')
+            
+    except Exception as e:
+        st.warning(f"Erro API IBGE SIDRA: {str(e)}")
+    
+    return pd.DataFrame()
+
+def buscar_dados_indice(indice: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Busca dados de um índice usando múltiplas fontes em ordem de prioridade"""
+    # Verificar cache primeiro
+    chave_cache = f"{indice}_{data_inicio}_{data_final}"
+    dados_cache = cache.get(chave_cache)
+    
+    if dados_cache:
+        st.info(f"📦 Usando dados em cache para {indice}")
+        return pd.DataFrame(dados_cache)
+    
+    config_indice = CODIGOS_INDICES.get(indice)
+    if not config_indice:
+        return pd.DataFrame()
+    
+    # Ordenar fontes por prioridade
+    fontes_ordenadas = []
+    for fonte in config_indice["fontes"]:
+        api_config = API_CONFIG.get(fonte["api"])
+        if api_config:
+            fontes_ordenadas.append((fonte, api_config))
+    
+    # Ordenar por prioridade da API
+    fontes_ordenadas.sort(key=lambda x: x[1]["prioridade"])
+    
+    for fonte, api_config in fontes_ordenadas:
+        st.info(f"🔍 Tentando {fonte['api']} para {indice}...")
+        
+        try:
+            if fonte["api"].startswith("BCB"):
+                df = buscar_dados_bcb(api_config, fonte["codigo"], data_inicio, data_final)
+            elif fonte["api"] == "IBGE_NOVO":
+                df = buscar_dados_ibge_novo(api_config, fonte["codigo"], data_inicio, data_final)
+            elif fonte["api"] == "IBGE_SIDRA":
+                df = buscar_dados_ibge_sidra(api_config, fonte["codigo"], data_inicio, data_final)
+            else:
+                continue
+            
+            if not df.empty:
+                st.success(f"✅ Dados obtidos de {fonte['api']} para {indice}")
+                
+                # Salvar no cache
+                cache.set(chave_cache, df.to_dict('records'), duracao_horas=6)
+                
+                return df
+                
+        except Exception as e:
+            st.warning(f"❌ Falha em {fonte['api']}: {str(e)}")
+            continue
+    
+    st.error(f"❌ Todas as fontes falharam para {indice}")
+    return pd.DataFrame()
+
+def get_indices_disponiveis() -> Dict[str, dict]:
+    """Verifica disponibilidade dos índices de forma inteligente"""
+    hoje = date.today()
+    data_teste = date(hoje.year - 1, hoje.month, 1)
+    
+    st.sidebar.info("🔍 Verificando disponibilidade dos índices...")
+    
+    indices_disponiveis = {}
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(buscar_dados_indice, indice, data_teste, hoje): indice 
+            for indice in CODIGOS_INDICES.keys()
+        }
+        
         for future in concurrent.futures.as_completed(futures):
             indice = futures[future]
             try:
-                results[indice] = future.result()
+                df = future.result(timeout=30)
+                if not df.empty:
+                    indices_disponiveis[indice] = {
+                        'nome': f"{indice} - Disponível",
+                        'disponivel': True,
+                        'ultima_data': df['data'].max().strftime("%m/%Y"),
+                        'qtd_dados': len(df)
+                    }
+                    st.sidebar.success(f"✅ {indice}: {len(df)} períodos")
+                else:
+                    st.sidebar.error(f"❌ {indice}: Sem dados")
+            except concurrent.futures.TimeoutError:
+                st.sidebar.warning(f"⏰ {indice}: Timeout")
             except Exception as e:
-                st.error(f"Erro ao buscar {indice}: {str(e)}")
-                results[indice] = pd.DataFrame()
+                st.sidebar.error(f"❌ {indice}: {str(e)}")
+    
+    if not indices_disponiveis:
+        st.sidebar.error("""
+        ⚠️ **Sistema usando modo de contingência**
         
-        return results
+        Todas as APIs estão indisponíveis no momento.
+        Recomendações:
+        - Verifique sua conexão com a internet
+        - Tente novamente em alguns minutos
+        - Use dados históricos locais se disponível
+        """)
+    
+    return indices_disponiveis
 
-def calcular_correcao_media(valor_original, data_inicio: date, data_fim: date, indices: list):
-    """
-    Calcula a correção pela média dos índices (versão paralelizada)
-    Retorna um dicionário com todos os detalhes do cálculo
-    """
-    if data_inicio >= data_fim:
+def calcular_correcao_individual(valor: float, data_original: date, data_referencia: date, indice: str) -> dict:
+    """Calcula correção monetária individual com tratamento robusto"""
+    if data_original > data_referencia:
         return {
-            'indices': indices,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
+            'sucesso': False,
+            'mensagem': 'Data de referência deve ser posterior à data original',
+            'valor_corrigido': valor,
             'fator_correcao': 1.0,
             'variacao_percentual': 0.0,
-            'valor_corrigido': valor_original,
-            'resultados_parciais': [],
-            'indices_com_falha': indices,
-            'sucesso': False,
-            'mensagem': 'Data de origem posterior à referência'
+            'indice': indice
         }
     
-    # Busca todos os índices de uma vez (paralelizado)
-    dados_indices = fetch_multiple_indices(indices, data_inicio, data_fim)
+    try:
+        dados = buscar_dados_indice(indice, data_original, data_referencia)
+        
+        if dados.empty:
+            return {
+                'sucesso': False,
+                'mensagem': f'Não foram encontrados dados para {indice} no período',
+                'valor_corrigido': valor,
+                'fator_correcao': 1.0,
+                'variacao_percentual': 0.0,
+                'indice': indice
+            }
+        
+        # Calcular fator de correção acumulado
+        fator_correcao = (1 + dados['valor']).prod()
+        variacao_percentual = (fator_correcao - 1) * 100
+        valor_corrigido = valor * fator_correcao
+        
+        return {
+            'sucesso': True,
+            'valor_original': valor,
+            'valor_corrigido': valor_corrigido,
+            'fator_correcao': fator_correcao,
+            'variacao_percentual': variacao_percentual,
+            'indice': indice,
+            'detalhes': dados,
+            'mensagem': f'Correção calculada com {len(dados)} períodos'
+        }
+        
+    except Exception as e:
+        return {
+            'sucesso': False,
+            'mensagem': f'Erro ao calcular correção: {str(e)}',
+            'valor_corrigido': valor,
+            'fator_correcao': 1.0,
+            'variacao_percentual': 0.0,
+            'indice': indice
+        }
+
+def calcular_correcao_media(valor: float, data_original: date, data_referencia: date, indices: List[str]) -> dict:
+    """Calcula correção pela média de múltiplos índices"""
+    if data_original > data_referencia:
+        return {
+            'sucesso': False,
+            'mensagem': 'Data de referência deve ser posterior à data original',
+            'valor_corrigido': valor,
+            'fator_correcao': 1.0,
+            'variacao_percentual': 0.0
+        }
     
     resultados = []
     fatores = []
     indices_com_falha = []
     
-    for indice, dados in dados_indices.items():
-        if dados.empty:
-            indices_com_falha.append(indice)
-            st.warning(f"Não foram encontrados dados para {indice} no período")
-            continue
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(calcular_correcao_individual, valor, data_original, data_referencia, indice): indice 
+            for indice in indices
+        }
         
-        fator = (1 + dados['valor']).prod()
-        fatores.append(fator)
-        resultados.append({
-            'indice': indice,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
-            'fator_correcao': fator,
-            'variacao_percentual': (fator - 1) * 100,
-            'valor_corrigido': valor_original * fator,
-            'detalhes': dados,
-            'sucesso': True,
-            'mensagem': 'Cálculo realizado com sucesso'
-        })
+        for future in concurrent.futures.as_completed(futures):
+            indice = futures[future]
+            try:
+                resultado = future.result(timeout=30)
+                if resultado['sucesso']:
+                    fatores.append(resultado['fator_correcao'])
+                    resultados.append(resultado)
+                else:
+                    indices_com_falha.append(indice)
+                    st.warning(f"Falha no índice {indice}: {resultado['mensagem']}")
+            except Exception as e:
+                indices_com_falha.append(indice)
+                st.warning(f"Erro no índice {indice}: {str(e)}")
     
     if not fatores:
         return {
-            'indices': indices,
-            'data_inicio': data_inicio.strftime("%m/%Y"),
-            'data_fim': data_fim.strftime("%m/%Y"),
-            'valor_original': valor_original,
+            'sucesso': False,
+            'mensagem': 'Nenhum índice retornou dados válidos',
+            'valor_corrigido': valor,
             'fator_correcao': 1.0,
             'variacao_percentual': 0.0,
-            'valor_corrigido': valor_original,
-            'resultados_parciais': [],
-            'indices_com_falha': indices,
-            'sucesso': False,
-            'mensagem': 'Nenhum índice retornou dados válidos'
+            'indices_com_falha': indices_com_falha
         }
     
-    # Calcula a média geométrica dos fatores
-    fator_medio = (pd.Series(fatores).prod()) ** (1/len(fatores))
-    variacao_media = (fator_medio - 1) * 100
+    # Calcular média geométrica
+    fator_medio = 1.0
+    for fator in fatores:
+        fator_medio *= fator
+    fator_medio = fator_medio ** (1/len(fatores))
+    
+    variacao_percentual = (fator_medio - 1) * 100
+    valor_corrigido = valor * fator_medio
     
     return {
-        'indices': [r['indice'] for r in resultados],
-        'data_inicio': data_inicio.strftime("%m/%Y"),
-        'data_fim': data_fim.strftime("%m/%Y"),
-        'valor_original': valor_original,
+        'sucesso': True,
+        'valor_original': valor,
+        'valor_corrigido': valor_corrigido,
         'fator_correcao': fator_medio,
-        'variacao_percentual': variacao_media,
-        'valor_corrigido': valor_original * fator_medio,
+        'variacao_percentual': variacao_percentual,
         'resultados_parciais': resultados,
         'indices_com_falha': indices_com_falha,
-        'sucesso': True,
-        'mensagem': f'Cálculo realizado com {len(resultados)}/{len(indices)} índices'
+        'mensagem': f'Cálculo com {len(fatores)} de {len(indices)} índices'
     }
 
-def formatar_moeda(valor):
-    """Formata valores monetários no padrão brasileiro"""
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def formatar_moeda(valor: float) -> str:
+    """Formata valor como moeda brasileira"""
+    if valor == 0:
+        return "R$ 0,00"
+    return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def limpar_cache():
+    """Limpa todo o cache"""
+    try:
+        if os.path.exists("indices_cache.db"):
+            os.remove("indices_cache.db")
+        cache._init_db()
+        st.success("✅ Cache limpo com sucesso!")
+    except Exception as e:
+        st.error(f"❌ Erro ao limpar cache: {str(e)}")
