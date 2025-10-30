@@ -18,6 +18,9 @@ st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
 st.title("📈 Correção Monetária Completa")
 
 # Importações do módulo de índices
+# Certifique-se que o arquivo indices.py está na pasta 'utils'
+# ou ajuste o 'from' abaixo para o local correto.
+# Ex: from indices import ... (se estiver na mesma pasta)
 from utils.indices import (
     get_indices_disponiveis,
     calcular_correcao_individual,
@@ -141,12 +144,12 @@ class PDFProcessor:
 
     def _extract_parcelas(self, text: str):
         padrao_parcela = (
-            r'([A-Z]?\.?\d+/\d+)\s+' 
-            r'(\d{2}/\d{2}/\d{4})\s+' 
-            r'(?:\d+\s+)?' 
-            r'([\d\.,]+)\s+' 
-            r'(?:\d{2}/\d{2}/\d{4}\s+)?' 
-            r'([\d\.,]*)' 
+            r'([A-Z]?\.?\d+/\d+)\s+'  
+            r'(\d{2}/\d{2}/\d{4})\s+'  
+            r'(?:\d+\s+)?'  
+            r'([\d\.,]+)\s+'  
+            r'(?:\d{2}/\d{2}/\d{4}\s+)?'  
+            r'([\d\.,]*)'  
         )
         
         matches = re.finditer(padrao_parcela, text)
@@ -245,30 +248,34 @@ def render_sidebar():
         )
         indices_para_calculo = [indice_selecionado]
     else:
-        # CORREÇÃO: Usar session_state para manter a seleção de índices
-        if 'indices_selecionados' not in st.session_state:
-            st.session_state.indices_selecionados = list(indices_disponiveis.keys())
+        # ===== INÍCIO DA CORREÇÃO =====
         
-        indices_selecionados = st.sidebar.multiselect(
+        opcoes_indices = list(indices_disponiveis.keys())
+        
+        # Inicializa o estado do multiselect (gerenciado pelo 'key')
+        # SE ele não existir ainda.
+        if 'multiselect_indices' not in st.session_state:
+            st.session_state.multiselect_indices = opcoes_indices
+        
+        # O multiselect agora lê e escreve diretamente 
+        # em st.session_state.multiselect_indices.
+        st.sidebar.multiselect(
             "Selecione os índices para cálculo da média",
-            options=list(indices_disponiveis.keys()),
-            default=st.session_state.indices_selecionados,
+            options=opcoes_indices,
             key="multiselect_indices"
+            # Não precisamos mais do 'default' aqui, pois o 'key' gerencia o estado.
         )
         
-        # Atualizar session_state apenas quando houver mudança
-        if indices_selecionados != st.session_state.indices_selecionados:
-            st.session_state.indices_selecionados = indices_selecionados
+        # A variável 'indices_para_calculo' lê o valor ATUAL do session_state
+        indices_para_calculo = st.session_state.multiselect_indices
         
-        indices_para_calculo = st.session_state.indices_selecionados
-        
+        # A lógica de validação agora apenas avisa, 
+        # sem reverter a seleção do usuário.
         if len(indices_para_calculo) < 2:
             st.sidebar.warning("Selecione pelo menos 2 índices para calcular a média.")
-            # Garantir que sempre tenha pelo menos 2 índices selecionados
-            if len(indices_para_calculo) == 0 and len(indices_disponiveis) >= 2:
-                indices_para_calculo = list(indices_disponiveis.keys())[:2]
-                st.session_state.indices_selecionados = indices_para_calculo
-    
+        
+        # ===== FIM DA CORREÇÃO =====
+            
     # Data de referência para correção
     data_referencia = st.sidebar.date_input(
         "Data de referência para correção",
@@ -414,18 +421,18 @@ def render_correcao_manual(config: Dict):
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         st.metric(
-                            "Total Original", 
+                            "Total Original",  
                             formatar_moeda(df_resultados["Valor Original"].sum())
                         )
                     with col2:
                         st.metric(
-                            "Total Corrigido", 
+                            "Total Corrigido",  
                             formatar_moeda(df_resultados["Valor Corrigido"].sum())
                         )
                     with col3:
                         variacao_total = ((df_resultados["Valor Corrigido"].sum() - df_resultados["Valor Original"].sum()) / df_resultados["Valor Original"].sum()) * 100
                         st.metric(
-                            "Variação Total", 
+                            "Variação Total",  
                             f"{variacao_total:+.2f}%"
                         )
                     
