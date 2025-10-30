@@ -218,9 +218,29 @@ def render_sidebar():
     """Renderiza a barra lateral com configurações"""
     st.sidebar.header("Configurações de Correção")
     
+    # Botão para limpar cache
+    if st.sidebar.button("🗑️ Limpar Cache", help="Limpa dados em cache para forçar atualização"):
+        from utils.indices import limpar_cache
+        limpar_cache()
+        st.rerun()
+    
     # Verificar índices disponíveis
-    with st.spinner("Verificando disponibilidade dos índices..."):
+    with st.sidebar.expander("📊 Status dos Índices", expanded=True):
         indices_disponiveis = get_indices_disponiveis()
+    
+    if not indices_disponiveis:
+        st.sidebar.warning("""
+        ⚠️ **Modo de Contingência Ativo**
+        
+        O sistema está enfrentando dificuldades para acessar as APIs oficiais.
+        Tentando fontes alternativas...
+        """)
+        # Forçar continuidade com índices básicos
+        indices_disponiveis = {
+            'IPCA': {'nome': 'IPCA - Tentando fontes alternativas', 'disponivel': False},
+            'IGPM': {'nome': 'IGP-M - Tentando fontes alternativas', 'disponivel': False},
+            'INPC': {'nome': 'INPC - Tentando fontes alternativas', 'disponivel': False}
+        }
     
     if not indices_disponiveis:
         st.sidebar.error("""
