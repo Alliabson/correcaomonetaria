@@ -439,7 +439,7 @@ def render_correcao_manual(config: Dict):
                         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                             df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
                         excel_data = output.getvalue()
-                        b64_xlsx = base664.b64encode(excel_data).decode()
+                        b64_xlsx = base64.b64encode(excel_data).decode()
                         href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="correcao_manual.xlsx" style="background-color: #2196F3; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📊 Baixar Excel</a>'
                         st.markdown(href_xlsx, unsafe_allow_html=True)
                 else:
