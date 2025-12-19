@@ -13,20 +13,21 @@ import time
 
 # Configuração da página
 st.set_page_config(page_title="Correção Monetária Completa", layout="wide")
+
+# Título do aplicativo
 st.title("📈 Correção Monetária Completa")
 
-# Importações do módulo de índices (Novo e Robusto)
-try:
-    from utils.indices import (
-        get_indices_disponiveis,
-        calcular_correcao_individual,
-        calcular_correcao_media,
-        formatar_moeda,
-        limpar_cache
-    )
-except ImportError as e:
-    st.error(f"Erro ao importar módulos: {e}. Verifique se requirements.txt foi instalado.")
-    st.stop()
+# Importações do módulo de índices
+# Certifique-se que o arquivo indices.py está na pasta 'utils'
+# ou ajuste o 'from' abaixo para o local correto.
+# Ex: from indices import ... (se estiver na mesma pasta)
+from utils.indices import (
+    get_indices_disponiveis,
+    calcular_correcao_individual,
+    calcular_correcao_media,
+    formatar_moeda,
+    limpar_cache
+)
 
 # ===== Classes para modelagem dos dados =====
 class Cliente:
@@ -201,61 +202,75 @@ class PDFProcessor:
 
 # ===== Interface do Usuário =====
 def render_sidebar():
+    """Renderiza a barra lateral com configurações"""
     st.sidebar.header("Configurações de Correção")
     
-    if st.sidebar.button("🗑️ Limpar Cache", help="Limpa dados locais e re-baixa das fontes"):
-        limpar_cache()
+    # Botão para limpar cache
+    if st.sidebar.button("🗑️ Limpar Cache", help="Limpa dados em cache para forçar atualização"):
+        limpar_cache() # Limpa o cache do SQLite
+        # ===== INÍCIO DA CORREÇÃO =====
+        get_indices_disponiveis.clear() # Limpa o cache do Streamlit (@st.cache_data)
+        # ===== FIM DA CORREÇÃO =====
         st.rerun()
     
     # Verificar índices disponíveis
+    # Esta função agora usa o cache do Streamlit
     with st.sidebar.expander("📊 Status dos Índices", expanded=True):
         indices_disponiveis = get_indices_disponiveis()
-        
-        # Mostra status visual
-        for nome, status in indices_disponiveis.items():
-            icon = "✅" if status['disponivel'] else "❌"
-            dt = status.get('ultima_data', '-')
-            st.caption(f"{icon} {nome} (Até: {dt})")
-
+    
     if not indices_disponiveis:
-        st.sidebar.error("Nenhum índice disponível. Verifique sua conexão.")
-
+        st.sidebar.warning("""
+        ⚠️ **Modo de Contingência Ativo**
+        
+        O sistema está enfrentando dificuldades para acessar as APIs oficiais.
+        """)
+        indices_disponiveis = {
+            'IPCA': {'nome': 'IPCA - Tentando fontes alternativas', 'disponivel': False},
+            'IGPM': {'nome': 'IGP-M - Tentando fontes alternativas', 'disponivel': False},
+            'INPC': {'nome': 'INPC - Tentando fontes alternativas', 'disponivel': False}
+        }
+    
+    # Modo de operação
     modo = st.sidebar.radio(
         "Modo de Operação",
         options=["Corrigir Valores do PDF", "Corrigir Valor Manual"],
         index=0
     )
     
+    # Seleção do método de correção
     metodo_correcao = st.sidebar.radio(
         "Método de Correção",
         options=["Índice Único", "Média de Índices"],
         index=0
     )
     
-    opcoes_keys = list(indices_disponiveis.keys())
-    
     if metodo_correcao == "Índice Único":
         indice_selecionado = st.sidebar.selectbox(
             "Selecione o índice econômico",
-            options=opcoes_keys,
-            index=0 if opcoes_keys else None
+            options=list(indices_disponiveis.keys()),
+            index=0
         )
-        indices_para_calculo = [indice_selecionado] if indice_selecionado else []
+        indices_para_calculo = [indice_selecionado]
     else:
+        opcoes_indices = list(indices_disponiveis.keys())
+        
+        # Esta lógica agora funciona, pois `opcoes_indices` 
+        # estará cheia desde a primeira execução.
         if 'multiselect_indices' not in st.session_state:
-            st.session_state.multiselect_indices = opcoes_keys
+            st.session_state.multiselect_indices = opcoes_indices
         
         st.sidebar.multiselect(
             "Selecione os índices para cálculo da média",
-            options=opcoes_keys,
+            options=opcoes_indices,
             key="multiselect_indices"
         )
         
         indices_para_calculo = st.session_state.multiselect_indices
         
         if len(indices_para_calculo) < 2:
-            st.sidebar.warning("Selecione pelo menos 2 índices.")
+            st.sidebar.warning("Selecione pelo menos 2 índices para calcular a média.")
             
+    # Data de referência para correção
     data_referencia = st.sidebar.date_input(
         "Data de referência para correção",
         value=datetime.now(pytz.timezone('America/Sao_Paulo')).date(),
@@ -270,6 +285,7 @@ def render_sidebar():
     }
 
 def render_correcao_manual(config: Dict):
+    """Renderiza a correção manual com capacidade de adicionar/remover parcelas"""
     st.subheader("Correção Monetária Manual")
     
     if "valores_manuais" not in st.session_state:
@@ -307,16 +323,25 @@ def render_correcao_manual(config: Dict):
         st.subheader("Valores para Correção")
         
         cols = st.columns([3, 2, 2, 1])
-        with cols[0]: st.markdown("**Valor (R$)**")
-        with cols[1]: st.markdown("**Data**")
-        with cols[2]: st.markdown("**Ações**")
+        with cols[0]:
+            st.markdown("**Valor (R$)**")
+        with cols[1]:
+            st.markdown("**Data**")
+        with cols[2]:
+            st.markdown("**Ações**")
         
         with st.form(key="form_remover_valores"):
             to_remove = []
+            
             for i, item in enumerate(st.session_state.valores_manuais):
                 cols = st.columns([3, 2, 2, 1])
-                with cols[0]: st.markdown(f"R$ {item['valor']:,.2f}")
-                with cols[1]: st.markdown(item['data'].strftime("%d/%m/%Y"))
+                
+                with cols[0]:
+                    st.markdown(f"R$ {item['valor']:,.2f}")
+                
+                with cols[1]:
+                    st.markdown(item['data'].strftime("%d/%m/%Y"))
+                
                 with cols[2]:
                     if st.checkbox(f"Remover", key=f"remove_{item['id']}"):
                         to_remove.append(i)
@@ -338,7 +363,7 @@ def render_correcao_manual(config: Dict):
                     data_valor = item["data"]
                     
                     if data_valor > config["data_referencia"]:
-                        st.warning(f"Data de referência deve ser posterior à data do valor {valor}")
+                        st.warning(f"Data de referência deve ser posterior à data do valor {valor} (data: {data_valor.strftime('%d/%m/%Y')})")
                         continue
                     
                     try:
@@ -362,17 +387,18 @@ def render_correcao_manual(config: Dict):
                                 "Valor Original": valor,
                                 "Data Original": data_valor.strftime("%d/%m/%Y"),
                                 "Valor Corrigido": correcao["valor_corrigido"],
-                                "Índice(s)": ', '.join(correcao.get('indices', [])),
+                                "Índice(s)": ', '.join(correcao.get('indices', config['indices_para_calculo'])),
                                 "Fator de Correção": correcao["fator_correcao"],
                                 "Variação (%)": correcao["variacao_percentual"]
                             })
                         else:
-                            st.warning(f"Erro ao corrigir valor R$ {valor:,.2f}: {correcao.get('mensagem', 'Erro desconhecido')}")
+                            st.warning(f"Erro ao corrigir valor R$ {valor:,.2f}: {correcao['mensagem']}")
                     except Exception as e:
                         st.error(f"Erro ao processar valor R$ {valor:,.2f}: {str(e)}")
                 
                 if resultados:
                     df_resultados = pd.DataFrame(resultados)
+                    
                     st.subheader("📊 Resultados da Correção")
                     st.dataframe(df_resultados.style.format({
                         "Valor Original": "R$ {:.2f}",
@@ -381,29 +407,40 @@ def render_correcao_manual(config: Dict):
                         "Variação (%)": "{:.2f}%"
                     }))
                     
-                    # Totais
                     col1, col2, col3 = st.columns(3)
-                    total_orig = df_resultados["Valor Original"].sum()
-                    total_corr = df_resultados["Valor Corrigido"].sum()
-                    variacao = ((total_corr - total_orig) / total_orig) * 100 if total_orig else 0
+                    with col1:
+                        st.metric(
+                            "Total Original",  
+                            formatar_moeda(df_resultados["Valor Original"].sum())
+                        )
+                    with col2:
+                        st.metric(
+                            "Total Corrigido",  
+                            formatar_moeda(df_resultados["Valor Corrigido"].sum())
+                        )
+                    with col3:
+                        variacao_total = ((df_resultados["Valor Corrigido"].sum() - df_resultados["Valor Original"].sum()) / df_resultados["Valor Original"].sum()) * 100
+                        st.metric(
+                            "Variação Total",  
+                            f"{variacao_total:+.2f}%"
+                        )
                     
-                    col1.metric("Total Original", formatar_moeda(total_orig))
-                    col2.metric("Total Corrigido", formatar_moeda(total_corr))
-                    col3.metric("Variação Total", f"{variacao:+.2f}%")
-
-                    # Exportar
+                    st.subheader("💾 Exportar Resultados")
                     col1, col2 = st.columns(2)
+                    
                     with col1:
                         csv = df_resultados.to_csv(index=False, sep=';', decimal=',')
                         b64_csv = base64.b64encode(csv.encode()).decode()
-                        href_csv = f'<a href="data:file/csv;base64,{b64_csv}" download="correcao_manual.csv" style="background-color: #4CAF50; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none;">📥 Baixar CSV</a>'
+                        href_csv = f'<a href="data:file/csv;base64,{b64_csv}" download="correcao_manual.csv" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📥 Baixar CSV</a>'
                         st.markdown(href_csv, unsafe_allow_html=True)
+                    
                     with col2:
                         output = BytesIO()
                         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                             df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
-                        b64_xlsx = base64.b64encode(output.getvalue()).decode()
-                        href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="correcao_manual.xlsx" style="background-color: #2196F3; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none;">📊 Baixar Excel</a>'
+                        excel_data = output.getvalue()
+                        b64_xlsx = base64.b64encode(excel_data).decode()
+                        href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="correcao_manual.xlsx" style="background-color: #2196F3; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📊 Baixar Excel</a>'
                         st.markdown(href_xlsx, unsafe_allow_html=True)
                 else:
                     st.warning("Nenhum resultado foi calculado com sucesso.")
@@ -411,31 +448,51 @@ def render_correcao_manual(config: Dict):
         st.info("➕ Adicione valores para correção usando o painel acima")
 
 def render_cliente_info(processor: PDFProcessor):
+    """Renderiza informações do cliente"""
     st.subheader("👤 Informações do Cliente")
     col1, col2 = st.columns(2)
-    with col1: st.text_input("Código", processor.cliente.codigo, disabled=True)
-    with col2: st.text_input("Nome", processor.cliente.nome, disabled=True)
+    with col1:
+        st.text_input("Código", processor.cliente.codigo, disabled=True)
+    with col2:
+        st.text_input("Nome", processor.cliente.nome, disabled=True)
 
 def render_venda_info(processor: PDFProcessor):
+    """Renderiza informações da venda"""
     st.subheader("💰 Informações da Venda")
     col1, col2, col3 = st.columns(3)
-    with col1: st.text_input("Número", processor.venda.numero, disabled=True)
-    with col2: st.text_input("Data", processor.venda.data, disabled=True)
-    with col3: st.text_input("Valor", formatar_moeda(processor.venda.valor), disabled=True)
+    with col1:
+        st.text_input("Número", processor.venda.numero, disabled=True)
+    with col2:
+        st.text_input("Data", processor.venda.data, disabled=True)
+    with col3:
+        st.text_input("Valor", formatar_moeda(processor.venda.valor), disabled=True)
 
 def render_pdf_analysis(processor: PDFProcessor, config: Dict):
+    """Renderiza a análise do PDF"""
     render_cliente_info(processor)
     render_venda_info(processor)
     
     st.divider()
     col1, col2 = st.columns(2)
-    with col1: InfoBox("Valor Original Total", formatar_moeda(processor.total_original), "blue")
-    with col2: InfoBox("Valor Recebido Total", formatar_moeda(processor.total_recebido), "green" if processor.total_recebido > 0 else "yellow")
+    with col1:
+        InfoBox(
+            "Valor Original Total",
+            formatar_moeda(processor.total_original),
+            "blue"
+        )
+    with col2:
+        InfoBox(
+            "Valor Recebido Total",
+            formatar_moeda(processor.total_recebido),
+            "green" if processor.total_recebido > 0 else "yellow"
+        )
     
     st.divider()
     if st.button("🎯 Calcular Correção Monetária", type="primary", key="btn_calcular_correcao"):
         with st.spinner("Calculando correção monetária..."):
             resultados = []
+            detalhes_indices = []
+            
             total_parcelas = len(processor.parcelas)
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -451,112 +508,149 @@ def render_pdf_analysis(processor: PDFProcessor, config: Dict):
                 data_pagamento = parse_date(parcela.data_recebimento) if parcela.data_recebimento else None
                 
                 if not data_vencimento:
+                    st.warning(f"Data de vencimento inválida para parcela {parcela.codigo}")
                     continue
                 
                 try:
-                    # Correção Original
+                    # Correção do valor original
                     if config["metodo_correcao"] == "Índice Único":
-                        correcao_orig = calcular_correcao_individual(
-                            valor_original, data_vencimento, config["data_referencia"], config["indices_para_calculo"][0]
+                        correcao_original = calcular_correcao_individual(
+                            valor_original,
+                            data_vencimento,
+                            config["data_referencia"],
+                            config["indices_para_calculo"][0]
                         )
                     else:
-                        correcao_orig = calcular_correcao_media(
-                            valor_original, data_vencimento, config["data_referencia"], config["indices_para_calculo"]
+                        correcao_original = calcular_correcao_media(
+                            valor_original,
+                            data_vencimento,
+                            config["data_referencia"],
+                            config["indices_para_calculo"]
                         )
                     
-                    # Correção Pago
-                    correcao_pago = None
+                    # Correção do valor recebido (se houver data de pagamento)
+                    correcao_recebido = None
                     if data_pagamento and valor_pago > 0:
                         if config["metodo_correcao"] == "Índice Único":
-                            correcao_pago = calcular_correcao_individual(
-                                valor_pago, data_pagamento, config["data_referencia"], config["indices_para_calculo"][0]
+                            correcao_recebido = calcular_correcao_individual(
+                                valor_pago,
+                                data_pagamento,
+                                config["data_referencia"],
+                                config["indices_para_calculo"][0]
                             )
                         else:
-                            correcao_pago = calcular_correcao_media(
-                                valor_pago, data_pagamento, config["data_referencia"], config["indices_para_calculo"]
+                            correcao_recebido = calcular_correcao_media(
+                                valor_pago,
+                                data_pagamento,
+                                config["data_referencia"],
+                                config["indices_para_calculo"]
                             )
-
+                    
+                    # Adicionar ao dataframe de resultados
                     resultados.append({
                         'Parcela': parcela.codigo,
                         'Dt Vencim': parcela.data_vencimento,
                         'Dt Receb': parcela.data_recebimento if parcela.data_recebimento else "",
                         'Valor Original': valor_original,
-                        'Valor Original Corrigido': correcao_orig['valor_corrigido'] if correcao_orig['sucesso'] else valor_original,
+                        'Valor Original Corrigido': correcao_original['valor_corrigido'] if correcao_original['sucesso'] else valor_original,
                         'Valor Pago': valor_pago,
-                        'Valor Pago Corrigido': correcao_pago['valor_corrigido'] if correcao_pago and correcao_pago['sucesso'] else valor_pago,
-                        'Índice': config["indices_para_calculo"][0] if len(config["indices_para_calculo"]) == 1 else "Média",
-                        'Fator Orig': correcao_orig.get('fator_correcao', 1.0),
-                        'Status': '✅' if correcao_orig['sucesso'] else '❌'
+                        'Valor Pago Corrigido': correcao_recebido['valor_corrigido'] if correcao_recebido and correcao_recebido['sucesso'] else valor_pago,
+                        'Índice(s)': ', '.join(config["indices_para_calculo"]) if config["metodo_correcao"] == "Média de Índices" else config["indices_para_calculo"][0],
+                        'Fator Correção Original': correcao_original['fator_correcao'] if correcao_original['sucesso'] else 1.0,
+                        'Fator Correção Recebido': correcao_recebido['fator_correcao'] if correcao_recebido and correcao_recebido['sucesso'] else 1.0,
+                        'Variação (%) Original': correcao_original['variacao_percentual'] if correcao_original['sucesso'] else 0.0,
+                        'Variação (%) Recebido': correcao_recebido['variacao_percentual'] if correcao_recebido and correcao_recebido['sucesso'] else 0.0,
+                        'Status': '✅' if correcao_original['sucesso'] else '❌'
                     })
-
+                
                 except Exception as e:
-                    st.error(f"Erro na parcela {parcela.codigo}: {str(e)}")
+                    st.error(f"Erro ao corrigir parcela {parcela.codigo}: {str(e)}")
                     continue
             
             progress_bar.empty()
             status_text.empty()
             
             if resultados:
-                df_res = pd.DataFrame(resultados)
+                df_resultados = pd.DataFrame(resultados)
                 
-                st.subheader("📊 Resultados Detalhados")
-                st.dataframe(df_res.style.format({
+                st.subheader("📊 Resultados da Correção Monetária")
+                st.dataframe(df_resultados.style.format({
                     'Valor Original': lambda x: formatar_moeda(x),
                     'Valor Original Corrigido': lambda x: formatar_moeda(x),
                     'Valor Pago': lambda x: formatar_moeda(x),
                     'Valor Pago Corrigido': lambda x: formatar_moeda(x),
-                    'Fator Orig': '{:.6f}'
-                }))
+                    'Fator Correção Original': "{:.6f}",
+                    'Fator Correção Recebido': "{:.6f}",
+                    'Variação (%) Original': "{:.2f}%",
+                    'Variação (%) Recebido': "{:.2f}%"
+                }), use_container_width=True)
                 
-                # Resumo
+                # Resumo estatístico
                 st.subheader("📈 Resumo Estatístico")
                 col1, col2, col3, col4 = st.columns(4)
                 
-                tot_orig = df_res['Valor Original'].sum()
-                tot_orig_corr = df_res['Valor Original Corrigido'].sum()
-                tot_pago = df_res['Valor Pago'].sum()
-                tot_pago_corr = df_res['Valor Pago Corrigido'].sum()
+                total_original = df_resultados['Valor Original'].sum()
+                total_original_corrigido = df_resultados['Valor Original Corrigido'].sum()
+                total_recebido = df_resultados['Valor Pago'].sum()
+                total_recebido_corrigido = df_resultados['Valor Pago Corrigido'].sum()
                 
-                col1.metric("Total Original", formatar_moeda(tot_orig))
-                col2.metric("Original Corrigido", formatar_moeda(tot_orig_corr), formatar_moeda(tot_orig_corr - tot_orig))
-                col3.metric("Total Pago", formatar_moeda(tot_pago))
-                col4.metric("Pago Corrigido", formatar_moeda(tot_pago_corr), formatar_moeda(tot_pago_corr - tot_pago))
+                variacao_original = total_original_corrigido - total_original
+                variacao_recebido = total_recebido_corrigido - total_recebido
                 
-                # Exportação
-                st.subheader("💾 Exportar")
-                c1, c2 = st.columns(2)
-                with c1:
-                    csv = df_res.to_csv(index=False, sep=';', decimal=',')
-                    b64 = base64.b64encode(csv.encode()).decode()
-                    st.markdown(f'<a href="data:file/csv;base64,{b64}" download="relatorio_final.csv" style="background-color:#4CAF50;color:white;padding:10px;border-radius:5px;text-decoration:none">📥 Baixar CSV</a>', unsafe_allow_html=True)
-                with c2:
-                    out = BytesIO()
-                    with pd.ExcelWriter(out, engine='xlsxwriter') as w:
-                        df_res.to_excel(w, index=False)
-                    b64_xls = base64.b64encode(out.getvalue()).decode()
-                    st.markdown(f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xls}" download="relatorio_final.xlsx" style="background-color:#2196F3;color:white;padding:10px;border-radius:5px;text-decoration:none">📊 Baixar Excel</a>', unsafe_allow_html=True)
+                col1.metric("Total Original", formatar_moeda(total_original), formatar_moeda(variacao_original))
+                col2.metric("Total Original Corrigido", formatar_moeda(total_original_corrigido))
+                col3.metric("Total Recebido", formatar_moeda(total_recebido), formatar_moeda(variacao_recebido))
+                col4.metric("Total Recebido Corrigido", formatar_moeda(total_recebido_corrigido))
+                
+                # Exportar resultados
+                st.subheader("💾 Exportar Resultados")
+                col1, col2 = st.columns(2)
 
+                with col1:
+                    csv = df_resultados.to_csv(index=False, sep=';', decimal=',')
+                    b64_csv = base64.b64encode(csv.encode()).decode()
+                    href_csv = f'<a href="data:file/csv;base64,{b64_csv}" download="parcelas_corrigidas.csv" style="background-color: #4CAF50; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📥 Baixar CSV</a>'
+                    st.markdown(href_csv, unsafe_allow_html=True)
 
+                with col2:
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        df_resultados.to_excel(writer, index=False, sheet_name='Resultados')
+                    excel_data = output.getvalue()
+                    b64_xlsx = base64.b64encode(excel_data).decode()
+                    href_xlsx = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64_xlsx}" download="parcelas_corrigidas.xlsx" style="background-color: #2196F3; color: white; padding: 10px 20px; text-align: center; text-decoration: none; display: inline-block; border-radius: 5px;">📊 Baixar Excel</a>'
+                    st.markdown(href_xlsx, unsafe_allow_html=True)
+
+# ===== Aplicação principal =====
 def main():
     try:
+        # Configurações da barra lateral
         config = render_sidebar()
-        if not config: return
         
+        if not config:
+            st.warning("Não foi possível carregar as configurações. Tente novamente.")
+            return
+            
         if config["modo"] == "Corrigir Valor Manual":
             render_correcao_manual(config)
         else:
             uploaded_file = FileUploader()
+            
             if uploaded_file is not None:
                 processor = PDFProcessor()
                 if processor.process_pdf(uploaded_file):
                     render_pdf_analysis(processor, config)
                 else:
-                    st.error("Falha ao processar o PDF.")
+                    st.error("Falha ao processar o PDF. Verifique o formato do arquivo.")
             else:
-                st.info("📤 Faça upload de um arquivo PDF para começar.")
-                
+                st.info("📤 Faça upload de um arquivo PDF para começar a análise.")
+    
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Erro de conexão: {str(e)}")
+        st.info("Verifique sua conexão com a internet e tente novamente.")
     except Exception as e:
         st.error(f"❌ Ocorreu um erro inesperado: {str(e)}")
+        st.info("Se o problema persistir, entre em contato com o suporte técnico.")
 
 if __name__ == "__main__":
     main()
