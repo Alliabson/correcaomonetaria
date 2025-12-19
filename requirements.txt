@@ -5,8 +5,4 @@ pdfplumber
 python-dateutil
 pytz
 xlsxwriter
-urllib3
 sidrapy
-ipeadatapy
-lxml
-openpyxl
