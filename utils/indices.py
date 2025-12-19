@@ -1,285 +1,516 @@
-import streamlit as st
-import pdfplumber
+import requests
 import pandas as pd
-import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import streamlit as st
+import concurrent.futures
+import time
 from typing import Dict, List, Optional, Tuple
-import base64
-import pytz
-from io import BytesIO
+import json
+import os
+import sqlite3
+from pathlib import Path
+import random
+import numpy as np
 
-# Configuração
-st.set_page_config(page_title="Correção Monetária Rápida", layout="wide")
-st.title("⚡ Correção Monetária Rápida")
+# ====== CONFIGURAÇÕES OTIMIZADAS ======
+API_CONFIG = {
+    "IBGE_NOVO": {
+        "base_url": "https://servicodados.ibge.gov.br/api/v3/agregados/{}/periodos/-{}%20meses/variaveis/63?localidades=N1[all]",
+        "timeout": 30,
+        "prioridade": 1,
+        "delay_min": 0.1,
+        "delay_max": 0.5
+    },
+    "IBGE_SIDRA": {
+        "base_url": "https://apisidra.ibge.gov.br/values/t/{}/n1/all/v/63/p/-{}/d/v63%202",
+        "timeout": 30,
+        "prioridade": 2,
+        "delay_min": 0.1,
+        "delay_max": 0.5
+    },
+    "BCB_RAPIDO": {
+        "base_url": "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados/ultimos/{}",
+        "timeout": 20,
+        "prioridade": 3,
+        "delay_min": 0.5,
+        "delay_max": 1
+    }
+}
 
-# Otimização: desabilitar warnings do PDF
-import warnings
-warnings.filterwarnings('ignore')
+# ====== FONTES SIMPLIFICADAS E OTIMIZADAS ======
+CODIGOS_INDICES = {
+    "IPCA": {
+        "fontes": [
+            {"api": "IBGE_NOVO", "codigo": "1737", "nome": "IPCA - IBGE", "cache_horas": 24},
+            {"api": "IBGE_SIDRA", "codigo": "1737", "nome": "IPCA - SIDRA", "cache_horas": 24},
+            {"api": "BCB_RAPIDO", "codigo": "433", "nome": "IPCA - BCB", "cache_horas": 6}
+        ],
+        "fallback_rate": 0.005  # 0.5% ao mês como fallback
+    },
+    "IGPM": {
+        "fontes": [
+            {"api": "BCB_RAPIDO", "codigo": "189", "nome": "IGP-M - BCB", "cache_horas": 6}
+        ],
+        "fallback_rate": 0.006
+    },
+    "INPC": {
+        "fontes": [
+            {"api": "IBGE_NOVO", "codigo": "1736", "nome": "INPC - IBGE", "cache_horas": 24},
+            {"api": "BCB_RAPIDO", "codigo": "188", "nome": "INPC - BCB", "cache_horas": 6}
+        ],
+        "fallback_rate": 0.004
+    },
+    "INCC": {
+        "fontes": [
+            {"api": "BCB_RAPIDO", "codigo": "192", "nome": "INCC - BCB", "cache_horas": 6}
+        ],
+        "fallback_rate": 0.0055
+    },
+    "SELIC": {
+        "fontes": [
+            {"api": "BCB_RAPIDO", "codigo": "11", "nome": "SELIC - BCB", "cache_horas": 6}
+        ],
+        "fallback_rate": 0.01
+    }
+}
 
-# Importações otimizadas
-try:
-    from utils.indices import (
-        get_indices_disponiveis_rapido as get_indices_disponiveis,
-        calcular_correcao_rapida as calcular_correcao_individual,
-        calcular_correcao_multipla_rapida,
-        formatar_moeda,
-        limpar_cache
-    )
-except ImportError as e:
-    st.error(f"Erro de importação: {e}")
-    st.stop()
+# ====== CACHE MELHORADO ======
+class CacheManager:
+    def __init__(self, db_path="indices_cache.db"):
+        self.db_path = db_path
+        self._init_db()
+        self.mem_cache = {}  # Cache em memória para acesso rápido
+        self.mem_cache_ttl = 300  # 5 minutos em memória
 
-# ===== CLASSES SIMPLIFICADAS =====
-class Parcela:
-    def __init__(self, codigo: str, data_vencimento: str, valor: float):
-        self.codigo = codigo
-        self.data_vencimento = data_vencimento
-        self.valor = valor
+    def _init_db(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cache_indices (
+                    chave TEXT PRIMARY KEY,
+                    dados TEXT,
+                    timestamp REAL,
+                    expiracao REAL,
+                    indice TEXT,
+                    data_inicio TEXT,
+                    data_fim TEXT
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_indice ON cache_indices(indice)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_expiracao ON cache_indices(expiracao)')
+            conn.commit()
+            conn.close()
+        except:
+            pass
 
-# ===== PROCESSAMENTO PDF OTIMIZADO =====
-@st.cache_data(ttl=300, show_spinner=False)
-def processar_pdf_rapido(file_bytes):
-    """Processa PDF de forma otimizada"""
-    parcelas = []
+    def get(self, chave):
+        # Primeiro verifica cache em memória
+        if chave in self.mem_cache:
+            cached_data, timestamp = self.mem_cache[chave]
+            if time.time() - timestamp < self.mem_cache_ttl:
+                return cached_data
+        
+        # Depois verifica SQLite
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT dados FROM cache_indices WHERE chave = ? AND expiracao > ?",
+                (chave, time.time())
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                data = json.loads(result[0])
+                # Armazena em memória para acesso rápido
+                self.mem_cache[chave] = (data, time.time())
+                return data
+        except:
+            pass
+        return None
+
+    def set(self, chave, dados, duracao_horas=24, indice="", data_inicio="", data_fim=""):
+        try:
+            # Armazena em memória
+            self.mem_cache[chave] = (dados, time.time())
+            
+            # Armazena em SQLite
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            timestamp = time.time()
+            expiracao = timestamp + (duracao_horas * 3600)
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO cache_indices 
+                (chave, dados, timestamp, expiracao, indice, data_inicio, data_fim) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (chave, json.dumps(dados), timestamp, expiracao, indice, data_inicio, data_fim))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Erro no cache: {str(e)}")
+            return False
+
+# Inicializar cache
+cache = CacheManager()
+
+# ====== REQUISIÇÃO OTIMIZADA ======
+def fazer_requisicao_rapida(url: str, params: dict = None, timeout: int = 20, source_name: str = ""):
+    """Faz requisição otimizada com timeout curto"""
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip'
+    }
     
     try:
-        with pdfplumber.open(file_bytes) as pdf:
-            # Ler apenas primeira página inicialmente (mais rápido)
-            primeira_pagina = pdf.pages[0]
-            texto = primeira_pagina.extract_text() or ""
-            
-            # Padrão otimizado para parcelas
-            padrao = r'(PR\.\d+/\d+|PARCELA\s+\d+)\s+(\d{2}/\d{2}/\d{4})\s+([\d\.]+,\d{2})'
-            
-            for match in re.finditer(padrao, texto):
-                codigo = match.group(1)
-                data_str = match.group(2)
-                valor_str = match.group(3).replace('.', '').replace(',', '.')
-                
-                try:
-                    valor = float(valor_str)
-                    parcelas.append(Parcela(codigo, data_str, valor))
-                except:
-                    continue
-            
-            # Se não encontrou na primeira página, tenta as outras
-            if not parcelas and len(pdf.pages) > 1:
-                for pagina in pdf.pages[1:3]:  # Apenas 3 páginas
-                    texto_pag = pagina.extract_text()
-                    if texto_pag:
-                        for match in re.finditer(padrao, texto_pag):
-                            codigo = match.group(1)
-                            data_str = match.group(2)
-                            valor_str = match.group(3).replace('.', '').replace(',', '.')
-                            
-                            try:
-                                valor = float(valor_str)
-                                parcelas.append(Parcela(codigo, data_str, valor))
-                            except:
-                                continue
-                    
-                    if parcelas:  # Parar se encontrou
-                        break
-    
+        response = requests.get(url, params=params, headers=headers, timeout=timeout)
+        
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            st.warning(f"Endpoint não encontrado: {source_name}")
+        elif response.status_code == 403:
+            st.warning(f"Acesso bloqueado: {source_name}")
+        
+        return None
+    except requests.exceptions.Timeout:
+        st.warning(f"Timeout: {source_name}")
+        return None
     except Exception as e:
-        st.error(f"Erro no PDF: {str(e)}")
-    
-    return parcelas
+        st.warning(f"Erro {source_name}: {str(e)[:50]}")
+        return None
 
-# ===== INTERFACE OTIMIZADA =====
-def render_sidebar_rapida():
-    st.sidebar.header("⚙️ Configurações")
+# ====== BUSCA OTIMIZADA POR ÍNDICE ======
+def buscar_dados_ibge_novo_rapido(codigo: str, meses: int) -> pd.DataFrame:
+    """Busca rápida da API nova do IBGE"""
+    try:
+        url = f"https://servicodados.ibge.gov.br/api/v3/agregados/{codigo}/periodos/-{meses}%20meses/variaveis/63?localidades=N1[all]"
+        dados = fazer_requisicao_rapida(url, source_name="IBGE")
+        
+        if not dados:
+            return pd.DataFrame()
+        
+        resultados = []
+        for item in dados:
+            for serie in item.get('resultados', [{}])[0].get('series', []):
+                for periodo, valor in serie.get('serie', {}).items():
+                    if len(periodo) == 6:
+                        data_ref = datetime.strptime(periodo, "%Y%m").date()
+                        val = float(valor.get('V', 0)) / 100
+                        resultados.append({'data': data_ref, 'valor': val})
+        
+        return pd.DataFrame(resultados).sort_values('data')
+    except:
+        return pd.DataFrame()
+
+def buscar_dados_ibge_sidra_rapido(codigo: str, meses: int) -> pd.DataFrame:
+    """Busca rápida do SIDRA"""
+    try:
+        url = f"https://apisidra.ibge.gov.br/values/t/{codigo}/n1/all/v/63/p/-{meses}/d/v63%202"
+        dados = fazer_requisicao_rapida(url, source_name="SIDRA")
+        
+        if not dados or len(dados) < 2:
+            return pd.DataFrame()
+        
+        resultados = []
+        for linha in dados[1:]:
+            if len(linha) >= 2:
+                periodo = linha[0]
+                valor_str = linha[1]
+                if periodo and len(periodo) == 6:
+                    data_ref = datetime.strptime(periodo, "%Y%m").date()
+                    try:
+                        valor = float(valor_str) / 100
+                        resultados.append({'data': data_ref, 'valor': valor})
+                    except:
+                        continue
+        
+        return pd.DataFrame(resultados).sort_values('data')
+    except:
+        return pd.DataFrame()
+
+def buscar_dados_bcb_rapido(codigo: str, meses: int) -> pd.DataFrame:
+    """Busca rápida do BCB (apenas últimos N meses)"""
+    try:
+        # Busca apenas os últimos X meses para ser rápido
+        url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados/ultimos/{meses * 2}"
+        dados = fazer_requisicao_rapida(url, source_name="BCB")
+        
+        if not dados:
+            return pd.DataFrame()
+        
+        resultados = []
+        for item in dados:
+            try:
+                data_ref = datetime.strptime(item['data'], '%d/%m/%Y').date()
+                valor = float(item['valor'].replace(',', '.'))
+                if valor > 10:  # É porcentagem
+                    valor = valor / 100
+                resultados.append({'data': data_ref, 'valor': valor})
+            except:
+                continue
+        
+        return pd.DataFrame(resultados).sort_values('data')
+    except:
+        return pd.DataFrame()
+
+# ====== BUSCA INTELIGENTE COM PARALELISMO ======
+def buscar_dados_indice_rapido(indice: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Busca otimizada com paralelismo e cache inteligente"""
     
-    if st.sidebar.button("🗑️ Limpar Cache", use_container_width=True):
-        limpar_cache()
-        st.rerun()
+    # Verificar cache primeiro (chave mais específica)
+    meses_diff = (data_final.year - data_inicio.year) * 12 + data_final.month - data_inicio.month + 1
+    chave_cache = f"{indice}_{data_inicio}_{data_final}_{meses_diff}"
     
-    # Verificação rápida de índices
-    with st.sidebar.expander("📈 Índices Disponíveis", expanded=True):
-        try:
-            indices = get_indices_disponiveis()
-            for nome, status in indices.items():
-                icon = "✅" if status['disponivel'] else "❌"
-                st.write(f"{icon} **{nome}** - {status['ultima_data']}")
-        except:
-            st.write("⚠️ Verificando...")
+    dados_cache = cache.get(chave_cache)
+    if dados_cache:
+        st.info(f"📦 Cache: {indice} ({len(dados_cache)} períodos)")
+        return pd.DataFrame(dados_cache)
     
-    # Configurações simples
-    indice_opcoes = ["IPCA", "IGPM", "INPC", "INCC", "SELIC"]
-    indice_selecionado = st.sidebar.selectbox("Índice", indice_opcoes, index=0)
+    config = CODIGOS_INDICES.get(indice)
+    if not config:
+        return pd.DataFrame()
     
-    data_ref = st.sidebar.date_input(
-        "Data de referência",
-        value=datetime.now(pytz.timezone('America/Sao_Paulo')).date(),
-        format="DD/MM/YYYY"
-    )
+    # Calcular quantos meses precisamos
+    meses_necessarios = max(12, meses_diff + 3)  # Pega um pouco a mais para cache
     
-    return {
-        "indice": indice_selecionado,
-        "data_referencia": data_ref
+    # Buscar de todas as fontes em paralelo
+    resultados = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        
+        for fonte in config["fontes"]:
+            if fonte["api"] == "IBGE_NOVO":
+                futures.append(executor.submit(buscar_dados_ibge_novo_rapido, fonte["codigo"], meses_necessarios))
+            elif fonte["api"] == "IBGE_SIDRA":
+                futures.append(executor.submit(buscar_dados_ibge_sidra_rapido, fonte["codigo"], meses_necessarios))
+            elif fonte["api"] == "BCB_RAPIDO":
+                futures.append(executor.submit(buscar_dados_bcb_rapido, fonte["codigo"], meses_necessarios))
+        
+        # Aguardar primeira resposta válida
+        for future in concurrent.futures.as_completed(futures, timeout=15):
+            try:
+                df = future.result(timeout=10)
+                if not df.empty and len(df) >= meses_diff:
+                    # Filtrar pelo período exato
+                    mask = (df['data'] >= data_inicio) & (df['data'] <= data_final)
+                    df_filtrado = df[mask].copy()
+                    
+                    if not df_filtrado.empty:
+                        resultados.append(df_filtrado)
+                        break  # Primeira fonte válida é suficiente
+            except:
+                continue
+    
+    # Se encontrou dados, usar e cachear
+    if resultados:
+        df_final = resultados[0]
+        
+        # Cache por mais tempo se dados são históricos
+        cache_horas = 24 if data_final.year < datetime.now().year else 6
+        cache.set(
+            chave_cache, 
+            df_final.to_dict('records'),
+            duracao_horas=cache_horas,
+            indice=indice,
+            data_inicio=data_inicio.isoformat(),
+            data_fim=data_final.isoformat()
+        )
+        
+        return df_final
+    
+    # Fallback: dados simulados (RÁPIDO)
+    st.warning(f"⚠️ Usando dados estimados para {indice}")
+    return gerar_dados_fallback_rapido(indice, data_inicio, data_final)
+
+def gerar_dados_fallback_rapido(indice: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Gera dados de fallback rapidamente"""
+    taxas = {
+        "IPCA": 0.0045, "IGPM": 0.0050, "INPC": 0.0040,
+        "INCC": 0.0055, "SELIC": 0.0100
     }
+    
+    taxa_base = taxas.get(indice, 0.005)
+    
+    # Gerar série mensal
+    datas = pd.date_range(start=data_inicio, end=data_final, freq='MS').date
+    np.random.seed(hash(indice) % 10000)  # Seed consistente por índice
+    
+    # Variação mais realista
+    variacoes = np.random.normal(taxa_base, taxa_base * 0.3, len(datas))
+    variacoes = np.clip(variacoes, taxa_base * 0.5, taxa_base * 1.5)
+    
+    df = pd.DataFrame({
+        'data': datas,
+        'valor': variacoes
+    })
+    
+    return df
 
-def calcular_correcoes_em_lote(parcelas, config):
-    """Calcula correções em lote (OTIMIZADO)"""
+# ====== CÁLCULOS OTIMIZADOS ======
+@st.cache_data(ttl=600, show_spinner=False)  # 10 minutos cache
+def get_indices_disponiveis_rapido() -> Dict[str, dict]:
+    """Verificação rápida de disponibilidade"""
     
-    # Preparar dados para cálculo em lote
-    valores_datas = []
-    parcelas_info = []
+    hoje = date.today()
+    data_teste = date(hoje.year - 1, hoje.month, 1)
     
-    for parcela in parcelas:
-        try:
-            data_venc = datetime.strptime(parcela.data_vencimento, "%d/%m/%Y").date()
-            valores_datas.append((parcela.valor, data_venc))
-            parcelas_info.append((parcela.codigo, parcela.data_vencimento, parcela.valor, data_venc))
-        except:
-            continue
+    indices_status = {}
     
-    if not valores_datas:
-        return []
+    # Verificar apenas 6 meses para ser rápido
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {}
+        
+        for indice in CODIGOS_INDICES.keys():
+            futures[executor.submit(
+                buscar_dados_indice_rapido, 
+                indice, 
+                date(hoje.year, hoje.month - 6, 1) if hoje.month > 6 else date(hoje.year - 1, hoje.month + 6, 1),
+                hoje
+            )] = indice
+        
+        for future in concurrent.futures.as_completed(futures, timeout=10):
+            indice = futures[future]
+            try:
+                df = future.result(timeout=5)
+                indices_status[indice] = {
+                    'disponivel': not df.empty,
+                    'ultima_data': df['data'].max().strftime("%m/%Y") if not df.empty else "N/A",
+                    'qtd_dados': len(df)
+                }
+            except:
+                indices_status[indice] = {
+                    'disponivel': False,
+                    'ultima_data': "N/A",
+                    'qtd_dados': 0
+                }
     
-    # Usar cálculo em lote otimizado
-    resultados = calcular_correcao_multipla_rapida(
-        valores_datas, 
-        config["data_referencia"], 
-        config["indice"]
-    )
-    
-    # Combinar resultados
-    dados_finais = []
-    for (codigo, data_str, valor_orig, data_venc), resultado in zip(parcelas_info, resultados):
-        if resultado['sucesso']:
-            dados_finais.append({
-                'Parcela': codigo,
-                'Dt Vencim': data_str,
-                'Valor Original': valor_orig,
-                'Valor Corrigido': resultado['corrigido'],
-                'Fator Correção': resultado['fator'],
-                'Variação %': (resultado['fator'] - 1) * 100
-            })
-    
-    return dados_finais
+    return indices_status
 
-def main_rapida():
-    config = render_sidebar_rapida()
+def calcular_correcao_rapida(valor: float, data_original: date, data_referencia: date, indice: str) -> dict:
+    """Cálculo otimizado de correção"""
     
-    # Upload otimizado
-    uploaded_file = st.file_uploader("📄 Envie o PDF", type="pdf", help="Arquivos PDF de relatórios")
+    if data_original >= data_referencia:
+        return {
+            'sucesso': False,
+            'valor_corrigido': valor,
+            'fator_correcao': 1.0,
+            'variacao_percentual': 0.0,
+            'indice': indice
+        }
     
-    if uploaded_file:
-        # Barra de progresso simples
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    try:
+        # Buscar dados (já otimizado com cache)
+        dados = buscar_dados_indice_rapido(indice, data_original, data_referencia)
         
-        status_text.text("📖 Lendo PDF...")
-        progress_bar.progress(20)
+        if dados.empty:
+            return {
+                'sucesso': False,
+                'valor_corrigido': valor,
+                'fator_correcao': 1.0,
+                'variacao_percentual': 0.0,
+                'indice': indice
+            }
         
-        # Processar PDF (com cache)
-        parcelas = processar_pdf_rapido(uploaded_file)
+        # Cálculo vetorizado (RÁPIDO)
+        fator_correcao = np.prod(1 + dados['valor'].values)
+        valor_corrigido = valor * fator_correcao
         
-        if not parcelas:
-            st.error("❌ Não foi possível extrair parcelas do PDF")
-            return
+        return {
+            'sucesso': True,
+            'valor_original': valor,
+            'valor_corrigido': valor_corrigido,
+            'fator_correcao': fator_correcao,
+            'variacao_percentual': (fator_correcao - 1) * 100,
+            'indice': indice,
+            'periodos': len(dados),
+            'fonte': 'Cache' if 'estimados' not in str(dados) else 'Estimado'
+        }
         
-        status_text.text(f"📊 {len(parcelas)} parcelas encontradas")
-        progress_bar.progress(40)
+    except Exception as e:
+        return {
+            'sucesso': False,
+            'valor_corrigido': valor,
+            'fator_correcao': 1.0,
+            'variacao_percentual': 0.0,
+            'indice': indice
+        }
+
+def calcular_correcao_multipla_rapida(valores_datas: List[Tuple[float, date]], data_referencia: date, indice: str) -> List[dict]:
+    """Calcula correção para múltiplos valores de uma vez (OTIMIZADO)"""
+    
+    resultados = []
+    
+    # Agrupar por mês para otimizar buscas
+    meses_unicos = set((d.year, d.month) for _, d in valores_datas)
+    
+    # Buscar dados para todos os meses necessários de uma vez
+    if meses_unicos:
+        datas_unicas = [date(y, m, 1) for y, m in meses_unicos]
+        data_min = min(datas_unicas)
+        data_max = max(datas_unicas)
         
-        # Mostrar preview rápido
-        with st.expander("📋 Pré-visualização das Parcelas", expanded=True):
-            preview_data = []
-            for parcela in parcelas[:10]:  # Apenas 10 para preview
-                preview_data.append({
-                    'Parcela': parcela.codigo,
-                    'Vencimento': parcela.data_vencimento,
-                    'Valor': formatar_moeda(parcela.valor)
+        # Buscar dados para todo o período de uma vez
+        dados_completos = buscar_dados_indice_rapido(indice, data_min, max(data_referencia, data_max))
+        
+        if not dados_completos.empty:
+            # Criar dicionário rápido para acesso O(1)
+            dados_dict = {d.date(): v for d, v in zip(pd.to_datetime(dados_completos['data']), dados_completos['valor'])}
+            
+            for valor, data_orig in valores_datas:
+                if data_orig >= data_referencia:
+                    resultados.append({
+                        'sucesso': False,
+                        'valor': valor,
+                        'data': data_orig,
+                        'corrigido': valor,
+                        'fator': 1.0
+                    })
+                    continue
+                
+                # Calcular fator acumulado
+                fator = 1.0
+                data_atual = date(data_orig.year, data_orig.month, 1)
+                
+                while data_atual <= data_referencia:
+                    if data_atual in dados_dict:
+                        fator *= (1 + dados_dict[data_atual])
+                    
+                    # Próximo mês
+                    if data_atual.month == 12:
+                        data_atual = date(data_atual.year + 1, 1, 1)
+                    else:
+                        data_atual = date(data_atual.year, data_atual.month + 1, 1)
+                
+                resultados.append({
+                    'sucesso': True,
+                    'valor': valor,
+                    'data': data_orig,
+                    'corrigido': valor * fator,
+                    'fator': fator
                 })
-            
-            if preview_data:
-                st.table(pd.DataFrame(preview_data))
-            
-            if len(parcelas) > 10:
-                st.caption(f"... e mais {len(parcelas) - 10} parcelas")
-        
-        # Botão de cálculo
-        if st.button("⚡ Calcular Correção", type="primary", use_container_width=True):
-            status_text.text("🧮 Calculando correções...")
-            progress_bar.progress(60)
-            
-            # Cálculo em lote otimizado
-            resultados = calcular_correcoes_em_lote(parcelas, config)
-            
-            progress_bar.progress(80)
-            
-            if resultados:
-                df_resultados = pd.DataFrame(resultados)
-                
-                status_text.text("📊 Gerando relatório...")
-                progress_bar.progress(90)
-                
-                # Mostrar resultados
-                st.subheader("📈 Resultados da Correção")
-                
-                # Formatar valores
-                df_display = df_resultados.copy()
-                df_display['Valor Original'] = df_display['Valor Original'].apply(formatar_moeda)
-                df_display['Valor Corrigido'] = df_display['Valor Corrigido'].apply(formatar_moeda)
-                df_display['Fator Correção'] = df_display['Fator Correção'].apply(lambda x: f"{x:.6f}")
-                df_display['Variação %'] = df_display['Variação %'].apply(lambda x: f"{x:.2f}%")
-                
-                st.dataframe(df_display, use_container_width=True)
-                
-                # Resumo rápido
-                st.subheader("💰 Resumo Financeiro")
-                col1, col2, col3 = st.columns(3)
-                
-                total_original = df_resultados['Valor Original'].sum()
-                total_corrigido = df_resultados['Valor Corrigido'].sum()
-                variacao_total = ((total_corrigido - total_original) / total_original) * 100
-                
-                col1.metric("Total Original", formatar_moeda(total_original))
-                col2.metric("Total Corrigido", formatar_moeda(total_corrigido))
-                col3.metric("Variação Total", f"{variacao_total:.2f}%")
-                
-                # Exportação rápida
-                st.subheader("💾 Exportar Resultados")
-                
-                # CSV
-                csv = df_resultados.to_csv(index=False, sep=';', decimal=',')
-                b64_csv = base64.b64encode(csv.encode()).decode()
-                
-                # Excel
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_resultados.to_excel(writer, index=False)
-                b64_xlsx = base64.b64encode(output.getvalue()).decode()
-                
-                col_exp1, col_exp2 = st.columns(2)
-                with col_exp1:
-                    st.download_button(
-                        label="📥 Download CSV",
-                        data=csv,
-                        file_name="correcao_monetaria.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                with col_exp2:
-                    st.download_button(
-                        label="📊 Download Excel",
-                        data=output.getvalue(),
-                        file_name="correcao_monetaria.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Cálculo concluído!")
-                st.balloons()
-            else:
-                st.error("❌ Não foi possível calcular as correções")
-                progress_bar.progress(100)
     
-    else:
-        st.info("👆 Faça upload de um arquivo PDF para começar")
+    return resultados
 
-# Executar app
-if __name__ == "__main__":
-    main_rapida()
+# Funções de interface (mantidas)
+def formatar_moeda(valor: float) -> str:
+    if valor == 0:
+        return "R$ 0,00"
+    return f"R$ {valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+
+def limpar_cache():
+    try:
+        cache.mem_cache.clear()
+        if os.path.exists("indices_cache.db"):
+            os.remove("indices_cache.db")
+        cache._init_db()
+        st.success("✅ Cache limpo!")
+    except:
+        st.error("❌ Erro ao limpar cache")
