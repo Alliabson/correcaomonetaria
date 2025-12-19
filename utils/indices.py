@@ -13,26 +13,21 @@ import logging
 import math
 import urllib3
 
-# Desabilitar avisos de SSL (necessário para o "Stealth Mode" do BCB)
+# Desabilitar avisos de SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configuração de Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("IndicesEconomicos")
 
 # ==============================================================================
-# 1. MAPEAMENTO DE CÓDIGOS (MULTI-FONTE)
+# CONFIGURAÇÃO DAS FONTES
 # ==============================================================================
-# Cada índice possui códigos para 3 fontes diferentes.
 CODIGOS_REDUNDANTES = {
     "IPCA": {
         "nome": "IPCA (IBGE)",
         "fontes": [
-            # Fonte 1: IPEA (Mais estável para dados históricos)
             {"tipo": "ipea", "codigo": "PRECOS12_IPCA12"},
-            # Fonte 2: IBGE (Fonte oficial primária)
             {"tipo": "sidra", "tabela": "1737", "variavel": "63", "geral": "2265"},
-            # Fonte 3: BCB Direto (Fallback final)
             {"tipo": "bcb_direct", "codigo": "433"}
         ]
     },
@@ -48,7 +43,6 @@ CODIGOS_REDUNDANTES = {
         "nome": "IGP-M (FGV)",
         "fontes": [
             {"tipo": "ipea", "codigo": "IGP12_IGPM12"},
-            # IBGE não tem IGPM. Vamos direto pro BCB como fallback
             {"tipo": "bcb_direct", "codigo": "189"}
         ]
     },
@@ -62,17 +56,49 @@ CODIGOS_REDUNDANTES = {
     "SELIC": {
         "nome": "Taxa Selic Mensal",
         "fontes": [
-            {"tipo": "ipea", "codigo": "BM12_TJOVER12"},
-            {"tipo": "bcb_direct", "codigo": "11"} 
+            {"tipo": "ipea", "codigo": "BM12_TJOVER12"}, 
+            {"tipo": "bcb_direct", "codigo": "4390"} # 4390 é a série MENSAL acumulada, mais segura que a 11
         ]
     }
 }
 
 # ==============================================================================
-# 2. SISTEMA DE BANCO DE DADOS (PERSISTÊNCIA ROBUSTA)
+# SANITIZADOR DE DADOS (O GUARDIÃO)
+# ==============================================================================
+def sanitizar_taxa_mensal(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Corrige distorções de escala (Percentual vs Decimal).
+    Regra heurística para Brasil pós-1994:
+    - Se valor > 0.50 (50% ao mês), com certeza é erro de escala (ex: 1.0 em vez de 0.01).
+    - Divide por 100 para garantir.
+    """
+    if df.empty: return df
+    
+    # Remove valores nulos ou infinitos
+    df = df.replace([float('inf'), -float('inf')], 0).dropna()
+    
+    # Lógica de correção de escala
+    # Se a média da série for maior que 0.1 (10% a.m), provavelmente está em escala percentual (0-100)
+    # e não em escala decimal (0-1). O Real nunca teve média de 10% a.m por longos períodos.
+    media = df['valor'].abs().mean()
+    
+    if media > 0.1: # Gatilho de segurança
+        logger.warning(f"⚠️ Detectada escala percentual (Média {media:.4f}). Aplicando correção /100.")
+        df['valor'] = df['valor'] / 100
+        
+    # Trava de segurança secundária linha a linha (para outliers)
+    # Se ainda tiver algum valor > 1.0 (100% a.m), divide por 100
+    mask_erro = df['valor'].abs() > 1.0
+    if mask_erro.any():
+        df.loc[mask_erro, 'valor'] = df.loc[mask_erro, 'valor'] / 100
+        
+    return df
+
+# ==============================================================================
+# BANCO DE DADOS (V2 para forçar limpeza)
 # ==============================================================================
 class DatabaseHandler:
-    def __init__(self, db_name="indices_blindados.db"):
+    def __init__(self, db_name="indices_v2.db"): # Mudança de nome para limpar cache antigo
         self.db_name = db_name
         self._init_db()
 
@@ -80,7 +106,6 @@ class DatabaseHandler:
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
     def _init_db(self):
-        """Cria tabela se não existir"""
         try:
             with self._get_connection() as conn:
                 conn.execute("""
@@ -93,28 +118,22 @@ class DatabaseHandler:
                         PRIMARY KEY (indice, data_ref)
                     )
                 """)
-        except Exception as e:
-            logger.error(f"Erro DB Init: {e}")
+        except Exception:
+            pass
 
     def salvar_dados(self, indice: str, df: pd.DataFrame, fonte: str):
-        """Salva ou atualiza dados no SQLite"""
         if df.empty: return
         try:
+            # SANITIZAÇÃO ANTES DE SALVAR
+            df = sanitizar_taxa_mensal(df)
+            
             data_now = datetime.now()
             records = []
-            
-            # Normalização garantida
             df_save = df.copy()
             df_save['data'] = pd.to_datetime(df_save['data']).dt.strftime('%Y-%m-%d')
             
             for _, row in df_save.iterrows():
-                records.append((
-                    indice, 
-                    row['data'], 
-                    float(row['valor']), 
-                    fonte, 
-                    data_now
-                ))
+                records.append((indice, row['data'], float(row['valor']), fonte, data_now))
             
             with self._get_connection() as conn:
                 conn.executemany("""
@@ -122,12 +141,10 @@ class DatabaseHandler:
                     (indice, data_ref, valor, fonte_origem, data_update)
                     VALUES (?, ?, ?, ?, ?)
                 """, records)
-            logger.info(f"Persistência OK: {len(records)} registros para {indice} via {fonte}")
         except Exception as e:
-            logger.error(f"Erro ao salvar no DB: {e}")
+            logger.error(f"Erro DB Save: {e}")
 
     def recuperar_dados(self, indice: str) -> pd.DataFrame:
-        """Lê do SQLite"""
         try:
             with self._get_connection() as conn:
                 df = pd.read_sql(
@@ -139,31 +156,26 @@ class DatabaseHandler:
                 df['data'] = pd.to_datetime(df['data']).dt.date
                 return df
             return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"Erro leitura DB: {e}")
+        except Exception:
             return pd.DataFrame()
-
+            
     def limpar_tudo(self):
         try:
             if os.path.exists(self.db_name):
                 os.remove(self.db_name)
             self._init_db()
             return True
-        except Exception:
+        except:
             return False
 
 db = DatabaseHandler()
 
 # ==============================================================================
-# 3. MOTORES DE COLETA (DRIVERS)
+# DRIVERS (COLETA)
 # ==============================================================================
-
 class DataDrivers:
-    """Coleção de métodos estáticos para buscar dados em diferentes lugares"""
-
     @staticmethod
     def get_ipea(codigo: str) -> pd.DataFrame:
-        """Driver para IPEADATA"""
         try:
             serie = ipea.timeseries(codigo)
             if serie.empty: return pd.DataFrame()
@@ -175,19 +187,16 @@ class DataDrivers:
 
             new_df = pd.DataFrame()
             new_df['data'] = pd.to_datetime(df[col_data]).dt.date
-            # IPEA vem em percentual (ex: 0.53), dividir por 100
+            # IPEA geralmente vem em % (ex: 0.53 para 0.53%)
             new_df['valor'] = pd.to_numeric(df[col_valor], errors='coerce') / 100
             
             return new_df[new_df['data'] >= date(1994, 1, 1)].dropna().sort_values('data')
-        except Exception as e:
-            logger.warning(f"Falha IPEA ({codigo}): {e}")
+        except:
             return pd.DataFrame()
 
     @staticmethod
     def get_sidra(params: dict) -> pd.DataFrame:
-        """Driver para IBGE SIDRA"""
         try:
-            # last 240 = últimos 20 anos
             data = sidrapy.get_table(
                 table_code=params['tabela'],
                 territorial_level="1",
@@ -200,180 +209,127 @@ class DataDrivers:
 
             df = data.iloc[1:].copy()
             new_df = pd.DataFrame()
+            # Sidra vem em % (ex: 0.53 para 0.53%)
             new_df['valor'] = pd.to_numeric(df['V'], errors='coerce') / 100
             new_df['data'] = pd.to_datetime(df['D2C'], format="%Y%m", errors='coerce').dt.date
-            
             return new_df.dropna().sort_values('data')
-        except Exception as e:
-            logger.warning(f"Falha SIDRA: {e}")
+        except:
             return pd.DataFrame()
 
     @staticmethod
     def get_bcb_stealth(codigo: str) -> pd.DataFrame:
-        """
-        Driver para Banco Central (Modo Stealth).
-        Usa requests puro com headers falsos para evitar erro 403.
-        """
         url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=json"
-        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Connection': 'keep-alive',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none'
+            'Accept': 'application/json'
         }
-
         try:
-            response = requests.get(url, headers=headers, timeout=15, verify=False)
-            
+            # verify=False é crucial para o BCB
+            response = requests.get(url, headers=headers, timeout=10, verify=False)
             if response.status_code == 200:
-                dados = response.json()
-                df = pd.DataFrame(dados)
-                
+                df = pd.DataFrame(response.json())
                 new_df = pd.DataFrame()
                 new_df['data'] = pd.to_datetime(df['data'], dayfirst=True).dt.date
                 new_df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
                 
-                # Normalização: se > 10, assume que não foi dividido por 100
-                if new_df['valor'].max() > 10:
-                    new_df['valor'] = new_df['valor'] / 100
-                else:
-                    # Assumindo padrão moderno que já vem em % (ex 0.53)
-                    new_df['valor'] = new_df['valor'] / 100
-                
+                # BCB sempre manda em % (ex: 0.53). Dividir por 100.
+                new_df['valor'] = new_df['valor'] / 100
                 return new_df.dropna().sort_values('data')
-            else:
-                logger.warning(f"Falha BCB Status {response.status_code}")
-                return pd.DataFrame()
-        except Exception as e:
-            logger.warning(f"Falha BCB Stealth: {e}")
+            return pd.DataFrame()
+        except:
             return pd.DataFrame()
 
-
 # ==============================================================================
-# 4. ORQUESTRADOR (O MAESTRO)
+# ORQUESTRADOR
 # ==============================================================================
-
 def atualizar_indice_inteligente(nome_indice: str) -> pd.DataFrame:
-    """
-    Tenta TODAS as fontes disponíveis em ordem.
-    """
     config = CODIGOS_REDUNDANTES.get(nome_indice)
     if not config: return pd.DataFrame()
 
-    # Tentativa 1, 2, 3...
-    for i, fonte in enumerate(config['fontes']):
+    for fonte in config['fontes']:
         tipo = fonte['tipo']
+        df_temp = pd.DataFrame()
         
-        logger.info(f"Tentando atualizar {nome_indice} via {tipo} (Tentativa {i+1})...")
-        
-        if tipo == "ipea":
-            df_temp = DataDrivers.get_ipea(fonte['codigo'])
-        elif tipo == "sidra":
-            df_temp = DataDrivers.get_sidra(fonte)
-        elif tipo == "bcb_direct":
-            df_temp = DataDrivers.get_bcb_stealth(fonte['codigo'])
+        try:
+            if tipo == "ipea": df_temp = DataDrivers.get_ipea(fonte['codigo'])
+            elif tipo == "sidra": df_temp = DataDrivers.get_sidra(fonte)
+            elif tipo == "bcb_direct": df_temp = DataDrivers.get_bcb_stealth(fonte['codigo'])
+        except: continue
             
         if not df_temp.empty and len(df_temp) > 10:
+            # SANITIZAÇÃO AQUI TAMBÉM
+            df_temp = sanitizar_taxa_mensal(df_temp)
             db.salvar_dados(nome_indice, df_temp, tipo)
-            logger.info(f"✅ SUCESSO: {nome_indice} atualizado via {tipo}")
             return df_temp
             
-    logger.error(f"❌ TODAS AS FONTES FALHARAM PARA {nome_indice}. Tentando cache...")
     return db.recuperar_dados(nome_indice)
 
 # ==============================================================================
-# 5. FUNÇÕES EXPOSTAS AO APP (INTERFACE PÚBLICA)
+# FUNÇÕES EXPOSTAS
 # ==============================================================================
-
 @st.cache_data(ttl=3600)
 def get_indices_disponiveis() -> Dict[str, dict]:
-    """Inicializa e verifica o status de todos os índices"""
     status_final = {}
-    
-    # UI Feedback discreto
     progress_bar = st.sidebar.progress(0)
-    status_text = st.sidebar.empty()
     total = len(CODIGOS_REDUNDANTES)
     
     for idx, (key, val) in enumerate(CODIGOS_REDUNDANTES.items()):
-        status_text.text(f"Verificando {key}...")
-        
         df = db.recuperar_dados(key)
         
-        # Se vazio ou muito antigo (> 45 dias), atualiza
-        needs_update = False
-        if df.empty:
-            needs_update = True
-        else:
-            ultima_data = df['data'].max()
-            if (date.today() - ultima_data).days > 45:
-                needs_update = True
-        
-        if needs_update:
+        if df.empty or (date.today() - df['data'].max()).days > 45:
             df_novo = atualizar_indice_inteligente(key)
-            if not df_novo.empty:
-                df = df_novo
+            if not df_novo.empty: df = df_novo
 
-        # Monta objeto de status
-        if not df.empty:
-            status_final[key] = {
-                'nome': val['nome'],
-                'disponivel': True,
-                'ultima_data': df['data'].max().strftime("%m/%Y"),
-                'records': len(df)
-            }
-        else:
-            status_final[key] = {
-                'nome': val['nome'],
-                'disponivel': False,
-                'ultima_data': "N/A",
-                'records': 0
-            }
-        
+        status_final[key] = {
+            'nome': val['nome'],
+            'disponivel': not df.empty,
+            'ultima_data': df['data'].max().strftime("%m/%Y") if not df.empty else "N/A"
+        }
         progress_bar.progress((idx + 1) / total)
 
-    status_text.empty()
     progress_bar.empty()
     return status_final
 
 def formatar_moeda(valor: float) -> str:
     if valor is None: return "R$ 0,00"
+    if valor > 1_000_000_000_000: return "R$ Valor Irreal (Erro)" # Trava visual
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def limpar_cache():
     if db.limpar_tudo():
-        st.success("Base de dados local resetada. Recarregando fontes...")
+        st.success("Cache limpo com sucesso!")
         time.sleep(1)
-    else:
-        st.error("Erro ao limpar banco de dados.")
 
 def calcular_correcao_individual(valor: float, data_original: date, data_referencia: date, indice: str) -> dict:
     if data_original >= data_referencia:
         return {'sucesso': True, 'valor_corrigido': valor, 'fator_correcao': 1.0, 'variacao_percentual': 0.0, 'indices': [indice]}
 
     df = db.recuperar_dados(indice)
+    if df.empty: df = atualizar_indice_inteligente(indice)
+    
     if df.empty:
-        df = atualizar_indice_inteligente(indice)
+        return {'sucesso': False, 'mensagem': f'Índice {indice} sem dados.', 'valor_corrigido': valor}
 
-    if df.empty:
-        return {'sucesso': False, 'mensagem': f'Índice {indice} indisponível.', 'valor_corrigido': valor}
+    # FILTRO DE SEGURANÇA FINAL
+    df = sanitizar_taxa_mensal(df)
 
     dt_inicio = date(data_original.year, data_original.month, 1)
     dt_fim = date(data_referencia.year, data_referencia.month, 1)
     
-    # Filtra período (Mês inicial INCLUSO, Mês final EXCLUSO)
     mask = (df['data'] >= dt_inicio) & (df['data'] < dt_fim)
     subset = df.loc[mask]
     
     if subset.empty:
         if dt_inicio == dt_fim:
              return {'sucesso': True, 'valor_corrigido': valor, 'fator_correcao': 1.0, 'variacao_percentual': 0.0}
-        return {'sucesso': False, 'mensagem': f'Sem dados para o período {dt_inicio} a {dt_fim}', 'valor_corrigido': valor}
+        return {'sucesso': False, 'mensagem': 'Período sem dados.', 'valor_corrigido': valor}
     
     fator = (1 + subset['valor']).prod()
+    
+    # Trava de sanidade para o FATOR total
+    if fator > 1000: # Se o valor corrigir mais que 1000x, algo está muito errado para Brasil pós-Real
+        return {'sucesso': False, 'mensagem': f'Erro de cálculo: Fator explosivo ({fator:.2f}). Verifique dados.', 'valor_corrigido': valor}
+        
     valor_corrigido = valor * fator
     
     return {
@@ -381,12 +337,11 @@ def calcular_correcao_individual(valor: float, data_original: date, data_referen
         'valor_corrigido': valor_corrigido,
         'fator_correcao': fator,
         'variacao_percentual': (fator - 1) * 100,
-        'indices': [indice],
-        'debug_info': f"{len(subset)} meses"
+        'indices': [indice]
     }
 
 def calcular_correcao_media(valor: float, data_original: date, data_referencia: date, indices: List[str]) -> dict:
-    if not indices: return {'sucesso': False, 'mensagem': 'Nenhum índice'}
+    if not indices: return {'sucesso': False, 'mensagem': 'Sem índices'}
     
     fatores = []
     sucessos = []
@@ -398,7 +353,7 @@ def calcular_correcao_media(valor: float, data_original: date, data_referencia: 
             sucessos.append(ind)
     
     if not fatores:
-        return {'sucesso': False, 'mensagem': 'Falha em todos os índices selecionados'}
+        return {'sucesso': False, 'mensagem': 'Falha nos índices'}
     
     prod = math.prod(fatores)
     fator_medio = prod ** (1/len(fatores))
