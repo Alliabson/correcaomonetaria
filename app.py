@@ -22,10 +22,12 @@ st.title("📈 Correção Monetária Completa")
 # ou ajuste o 'from' abaixo para o local correto.
 # Ex: from indices import ... (se estiver na mesma pasta)
 from utils.indices import (
+    get_indices_disponiveis,
+    calcular_correcao_individual,
     calcular_correcao_media,
-    calcular_correcao_individual
+    formatar_moeda,
+    limpar_cache
 )
-
 
 # ===== Classes para modelagem dos dados =====
 class Cliente:
