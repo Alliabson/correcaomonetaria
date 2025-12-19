@@ -25,8 +25,7 @@ from utils.indices import (
     get_indices_disponiveis,
     calcular_correcao_individual,
     calcular_correcao_media,
-    formatar_moeda,
-    limpar_cache
+    formatar_moeda
 )
 
 # ===== Classes para modelagem dos dados =====
