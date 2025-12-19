@@ -20,8 +20,6 @@ def extract_from_pdf(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            if not text:
-                continue
             lines = text.split('\n')
             
             for line in lines:
