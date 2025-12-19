@@ -4,78 +4,49 @@ from datetime import datetime, date
 import streamlit as st
 import concurrent.futures
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 import json
 import os
 import sqlite3
 import urllib3
 
-# Desabilita avisos de certificado SSL (Necessário para APIs do governo)
+# Desabilita avisos de SSL (Crucial para APIs gov.br)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configurações atualizadas com múltiplos endpoints
-API_CONFIG = {
-    "BCB_PRIMARIO": {
-        "base_url": "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados",
-        "timeout": 15,
-        "prioridade": 1
-    },
-    "BCB_ALTERNATIVO": {
-        "base_url": "https://dados.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados",
-        "timeout": 15,
-        "prioridade": 2
-    },
-    "IBGE_NOVO": {
-        "base_url": "https://servicodados.ibge.gov.br/api/v3/agregados/{}/periodos/-{}%20meses/variaveis/63?localidades=N1[all]",
-        "timeout": 30,
-        "prioridade": 1
-    },
-    "IBGE_SIDRA": {
-        "base_url": "https://apisidra.ibge.gov.br/values/t/{}/n1/all/v/63/p/all/d/v63%202",
-        "timeout": 30,
-        "prioridade": 2
-    }
-}
+# ==============================================================================
+# CONFIGURAÇÕES DE API (A Mágica acontece aqui)
+# ==============================================================================
+# O IPEA não bloqueia o Streamlit Cloud. O BCB bloqueia.
+# Mapeamos os códigos do IPEA que correspondem aos do BCB.
 
-# Múltiplas fontes para cada índice
-CODIGOS_INDICES = {
+MAPA_CODIGOS = {
     "IPCA": {
-        "fontes": [
-            {"api": "BCB_PRIMARIO", "codigo": "433"},
-            {"api": "BCB_ALTERNATIVO", "codigo": "433"},
-            {"api": "IBGE_NOVO", "codigo": "1737"},
-            {"api": "IBGE_SIDRA", "codigo": "1737"},
-        ]
-    },
-    "IGPM": {
-        "fontes": [
-            {"api": "BCB_PRIMARIO", "codigo": "189"},
-            {"api": "BCB_ALTERNATIVO", "codigo": "189"},
-        ]
+        "ipea": "PRECOS12_IPCA12",  # Código IPEA
+        "bcb": "433"                # Código BCB
     },
     "INPC": {
-        "fontes": [
-            {"api": "BCB_PRIMARIO", "codigo": "188"},
-            {"api": "BCB_ALTERNATIVO", "codigo": "188"},
-        ]
+        "ipea": "PRECOS12_INPC12",
+        "bcb": "188"
+    },
+    "IGPM": {
+        "ipea": "IGP12_IGPM12",
+        "bcb": "189"
     },
     "INCC": {
-        "fontes": [
-            {"api": "BCB_PRIMARIO", "codigo": "192"},
-            {"api": "BCB_ALTERNATIVO", "codigo": "192"},
-        ]
+        "ipea": "IGP12_INCC12",
+        "bcb": "192"
     },
     "SELIC": {
-        "fontes": [
-            {"api": "BCB_PRIMARIO", "codigo": "11"},
-            {"api": "BCB_ALTERNATIVO", "codigo": "11"},
-        ]
+        "ipea": "BM12_TJOVER12",    # Selic acumulada mensal
+        "bcb": "4390"
     }
 }
 
-# Sistema de cache com SQLite
+# ==============================================================================
+# SISTEMA DE CACHE (SQLite Simples)
+# ==============================================================================
 class CacheManager:
-    def __init__(self, db_path="indices_cache_v2.db"): # Mudei o nome para limpar o cache antigo sujo
+    def __init__(self, db_path="indices_cache_v3.db"):
         self.db_path = db_path
         self._init_db()
     
@@ -87,295 +58,237 @@ class CacheManager:
                 CREATE TABLE IF NOT EXISTS cache_indices (
                     chave TEXT PRIMARY KEY,
                     dados TEXT,
-                    timestamp REAL,
-                    expiracao REAL
+                    timestamp REAL
                 )
             ''')
             conn.commit()
             conn.close()
-        except:
-            pass
+        except: pass
     
     def get(self, chave):
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT dados, timestamp, expiracao FROM cache_indices WHERE chave = ?",
-                (chave,)
-            )
-            result = cursor.fetchone()
+            # Cache válido por 24 horas (86400 segundos)
+            cursor.execute("SELECT dados, timestamp FROM cache_indices WHERE chave = ?", (chave,))
+            row = cursor.fetchone()
             conn.close()
-            
-            if result and time.time() < result[2]:
-                return json.loads(result[0])
+            if row:
+                dados, ts = row
+                if time.time() - ts < 86400: # 24h
+                    return json.loads(dados)
             return None
-        except:
-            return None
+        except: return None
     
-    def set(self, chave, dados, duracao_horas=24):
+    def set(self, chave, dados):
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            timestamp = time.time()
-            expiracao = timestamp + (duracao_horas * 3600)
-            
             cursor.execute(
-                '''INSERT OR REPLACE INTO cache_indices 
-                   (chave, dados, timestamp, expiracao) VALUES (?, ?, ?, ?)''',
-                (chave, json.dumps(dados), timestamp, expiracao)
+                "INSERT OR REPLACE INTO cache_indices (chave, dados, timestamp) VALUES (?, ?, ?)",
+                (chave, json.dumps(dados), time.time())
             )
             conn.commit()
             conn.close()
-            return True
-        except:
-            return False
+        except: pass
 
-# Inicializar cache
 cache = CacheManager()
 
 # ==============================================================================
-# AQUI ESTÁ A CORREÇÃO DO BLOQUEIO (Requisição Robusta)
+# FUNÇÕES DE BUSCA (A Lógica Robusta)
 # ==============================================================================
-def fazer_requisicao_robusta(url: str, params: dict = None, timeout: int = 30, max_retries: int = 3):
+
+def buscar_ipea(codigo_ipea: str) -> pd.DataFrame:
     """
-    Faz requisição fingindo ser um navegador real para evitar bloqueio 403 do BCB.
+    Busca dados no IPEA (API OData). 
+    Esta API NÃO BLOQUEIA o Streamlit Cloud.
     """
-    # Headers completos de um navegador Chrome no Windows
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1'
-    }
-
-    session = requests.Session()
-
-    for tentativa in range(max_retries):
-        try:
-            # verify=False IGNORA o erro de SSL do governo
-            response = session.get(
-                url, 
-                params=params, 
-                headers=headers, 
-                timeout=timeout, 
-                verify=False 
-            )
-            
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except:
-                    # Se não for JSON válido, tenta limpar caracteres estranhos
-                    return json.loads(response.text)
-
-            elif response.status_code in [403, 502, 503, 504]:
-                time.sleep(1 + tentativa) # Espera progressiva
-            else:
-                break
+    url = f"http://www.ipeadata.gov.br/api/odata4/ValoresSerie(SERCODIGO='{codigo_ipea}')"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if 'value' in data:
+                df = pd.DataFrame(data['value'])
+                # O IPEA retorna colunas: VALDATA (Data) e VALVALOR (Valor)
+                df = df.rename(columns={'VALDATA': 'data', 'VALVALOR': 'valor'})
                 
-        except Exception:
-            time.sleep(1)
+                # Tratamento de Data
+                df['data'] = pd.to_datetime(df['data']).dt.date
+                
+                # Tratamento de Valor (IPEA manda percentual ex: 0.53)
+                df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
+                df['valor'] = df['valor'] / 100 # Converte para decimal
+                
+                # Filtro (Pós Real)
+                df = df[df['data'] >= date(1995, 1, 1)]
+                return df[['data', 'valor']].sort_values('data')
+    except Exception as e:
+        print(f"Erro IPEA: {e}")
     
-    return None
-
-def buscar_dados_bcb(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
-    base_url = api_config["base_url"].format(codigo)
-    
-    # Tenta pegar tudo primeiro (mais rápido e estável no BCB)
-    dados = fazer_requisicao_robusta(base_url, {"formato": "json"}, api_config["timeout"])
-    
-    if dados:
-        try:
-            df = pd.DataFrame(dados)
-            df['data'] = pd.to_datetime(df['data'], dayfirst=True, errors='coerce').dt.date
-            df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
-            
-            # ==================================================================
-            # AQUI ESTÁ A CORREÇÃO DO CÁLCULO (R$ 42 MIL)
-            # ==================================================================
-            # O BCB envia 0.53 para significar 0.53%.
-            # O código antigo só dividia se fosse > 10. 0.53 < 10, então não dividia.
-            # Resultado: 53% de juros ao mês.
-            # CORREÇÃO: Dividimos por 100 sempre que o valor parecer percentual.
-            
-            # Se a média for maior que 0.1 (10%), assume que está em escala 0-100 e divide.
-            if df['valor'].abs().mean() > 0.1:
-                df['valor'] = df['valor'] / 100
-            
-            # Filtro adicional: Se algum valor individual for > 2.0 (200%), divide também
-            mask_erro = df['valor'].abs() > 2.0
-            if mask_erro.any():
-                df.loc[mask_erro, 'valor'] = df.loc[mask_erro, 'valor'] / 100
-            
-            df = df.dropna()
-            mask = (df['data'] >= data_inicio) & (df['data'] <= data_final)
-            return df[mask].copy()
-
-        except Exception:
-            pass
-            
     return pd.DataFrame()
 
-def buscar_dados_ibge_novo(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+def buscar_bcb_csv(codigo_bcb: str) -> pd.DataFrame:
+    """
+    Backup: Tenta baixar o CSV do BCB em vez de usar a API JSON.
+    O endpoint de arquivo às vezes tem regras de firewall mais brandas.
+    """
+    url = f"http://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo_bcb}/dados?formato=csv"
+    
     try:
-        meses_diff = (data_final.year - data_inicio.year) * 12 + data_final.month - data_inicio.month + 1
-        periodo = f"{meses_diff}" if meses_diff > 1 else "1"
-        url = api_config["base_url"].format(codigo, periodo)
-        dados = fazer_requisicao_robusta(url, timeout=api_config["timeout"])
+        # Pandas read_csv lida melhor com conexões diretas de arquivo
+        df = pd.read_csv(
+            url, 
+            sep=';', 
+            decimal=',', 
+            encoding='utf-8',
+            names=['data', 'valor'],
+            header=0
+        )
         
-        if not dados: return pd.DataFrame()
+        df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y', errors='coerce').dt.date
+        df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
         
-        resultados = []
-        for item in dados:
-            for resultado in item.get('resultados', []):
-                for serie in resultado.get('series', []):
-                    for periodo_str, valores in serie.get('serie', {}).items():
-                        if len(periodo_str) == 6:
-                            data_ref = datetime.strptime(periodo_str, "%Y%m").date()
-                            if data_inicio <= data_ref <= data_final:
-                                # IBGE manda string, ex: "0.53". Dividimos por 100.
-                                valor = float(valores.get('V', 0)) / 100 
-                                resultados.append({'data': data_ref, 'valor': valor})
+        # Tratamento de escala (BCB manda 0.53 para 0.53%)
+        # Se média > 0.1, divide por 100
+        if df['valor'].mean() > 0.1:
+            df['valor'] = df['valor'] / 100
+            
+        df = df[df['data'] >= date(1995, 1, 1)]
+        return df.dropna().sort_values('data')
         
-        if resultados:
-            return pd.DataFrame(resultados).sort_values('data')
-    except:
-        pass
+    except Exception as e:
+        print(f"Erro BCB CSV: {e}")
+        
     return pd.DataFrame()
 
-def buscar_dados_ibge_sidra(api_config: dict, codigo: str, data_inicio: date, data_final: date) -> pd.DataFrame:
-    try:
-        url = api_config["base_url"].format(codigo)
-        dados = fazer_requisicao_robusta(url, timeout=api_config["timeout"])
-        if not dados or len(dados) < 2: return pd.DataFrame()
-        
-        resultados = []
-        for linha in dados[1:]:
-            if len(linha) >= 2 and len(linha[0]) == 6:
-                data_ref = datetime.strptime(linha[0], "%Y%m").date()
-                if data_inicio <= data_ref <= data_final:
-                    # Sidra manda string "0.53". Dividimos por 100.
-                    resultados.append({'data': data_ref, 'valor': float(linha[1]) / 100})
-        
-        if resultados:
-            return pd.DataFrame(resultados).sort_values('data')
-    except:
-        pass
-    return pd.DataFrame()
-
-def buscar_dados_indice(indice: str, data_inicio: date, data_final: date) -> pd.DataFrame:
-    chave_cache = f"{indice}_{data_inicio}_{data_final}"
-    dados_cache = cache.get(chave_cache)
+def buscar_dados_indice(indice_nome: str, data_inicio: date, data_final: date) -> pd.DataFrame:
+    """Orquestrador: Tenta Cache -> IPEA -> BCB CSV"""
     
+    # 1. Tenta Cache
+    chave = f"{indice_nome}_{data_inicio}_{data_final}"
+    dados_cache = cache.get(chave)
     if dados_cache:
-        return pd.DataFrame(dados_cache)
-    
-    config_indice = CODIGOS_INDICES.get(indice)
-    if not config_indice: return pd.DataFrame()
-    
-    for fonte in config_indice["fontes"]:
-        api_config = API_CONFIG.get(fonte["api"])
-        if not api_config: continue
+        df = pd.DataFrame(dados_cache)
+        df['data'] = pd.to_datetime(df['data']).dt.date # Recupera objeto date
+        return df
+
+    codigos = MAPA_CODIGOS.get(indice_nome)
+    if not codigos: return pd.DataFrame()
+
+    df_final = pd.DataFrame()
+
+    # 2. Tenta IPEA (Prioridade Alta - Funciona na Nuvem)
+    df_ipea = buscar_ipea(codigos['ipea'])
+    if not df_ipea.empty:
+        df_final = df_ipea
+
+    # 3. Se IPEA falhar, Tenta BCB CSV (Backup)
+    if df_final.empty:
+        df_bcb = buscar_bcb_csv(codigos['bcb'])
+        if not df_bcb.empty:
+            df_final = df_bcb
+
+    # Filtra pelo período solicitado e Salva Cache
+    if not df_final.empty:
+        mask = (df_final['data'] >= data_inicio) & (df_final['data'] <= data_final)
+        df_filtrado = df_final.loc[mask].copy()
         
-        try:
-            if fonte["api"].startswith("BCB"):
-                df = buscar_dados_bcb(api_config, fonte["codigo"], data_inicio, data_final)
-            elif fonte["api"] == "IBGE_NOVO":
-                df = buscar_dados_ibge_novo(api_config, fonte["codigo"], data_inicio, data_final)
-            elif fonte["api"] == "IBGE_SIDRA":
-                df = buscar_dados_ibge_sidra(api_config, fonte["codigo"], data_inicio, data_final)
-            else:
-                continue
-            
-            if not df.empty:
-                cache.set(chave_cache, df.to_dict('records'), duracao_horas=6)
-                return df
-        except:
-            continue
-    
+        # Converte datas para string para salvar no JSON do cache
+        df_cache = df_filtrado.copy()
+        df_cache['data'] = df_cache['data'].astype(str)
+        cache.set(chave, df_cache.to_dict('records'))
+        
+        return df_filtrado
+
     return pd.DataFrame()
 
-# ===== INÍCIO DA CORREÇÃO =====
+# ==============================================================================
+# FUNÇÕES EXPOSTAS AO APP
+# ==============================================================================
+
 @st.cache_data(ttl=3600)
 def get_indices_disponiveis() -> Dict[str, dict]:
     hoje = date.today()
     data_teste = date(hoje.year - 1, hoje.month, 1)
     
-    # Feedback visual mais limpo
+    st.sidebar.caption("Sincronizando IPEA/BCB...")
     progress = st.sidebar.progress(0)
-    st.sidebar.caption("Sincronizando índices...")
     
-    indices_disponiveis = {}
-    total = len(CODIGOS_INDICES)
+    indices_status = {}
+    total = len(MAPA_CODIGOS)
     
+    # Execução em Paralelo para ser rápido
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(buscar_dados_indice, indice, data_teste, hoje): indice 
-            for indice in CODIGOS_INDICES.keys()
+            executor.submit(buscar_dados_indice, nome, data_teste, hoje): nome
+            for nome in MAPA_CODIGOS.keys()
         }
         
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            indice = futures[future]
+            nome = futures[future]
             try:
-                df = future.result(timeout=20)
-                if not df.empty:
-                    # Verificação visual da última taxa
-                    ultima_taxa = df.iloc[-1]['valor'] * 100
-                    indices_disponiveis[indice] = {
-                        'nome': f"{indice} ({ultima_taxa:.2f}%)",
-                        'disponivel': True,
-                        'ultima_data': df['data'].max().strftime("%m/%Y")
-                    }
-                else:
-                    indices_disponiveis[indice] = {'nome': f"{indice} (Erro)", 'disponivel': False}
+                df = future.result()
+                disponivel = not df.empty
+                
+                # Feedback Visual da Taxa
+                txt_taxa = ""
+                if disponivel:
+                    ult_val = df.iloc[-1]['valor'] * 100
+                    txt_taxa = f"({ult_val:.2f}%)"
+                
+                indices_status[nome] = {
+                    'nome': f"{nome} {txt_taxa}",
+                    'disponivel': disponivel,
+                    'ultima_data': df['data'].max().strftime("%m/%Y") if disponivel else "-"
+                }
             except:
-                indices_disponiveis[indice] = {'nome': f"{indice} (Erro)", 'disponivel': False}
+                indices_status[nome] = {'nome': nome, 'disponivel': False}
             
             progress.progress((i + 1) / total)
-    
+            
     progress.empty()
-    return indices_disponiveis
+    return indices_status
 
 def calcular_correcao_individual(valor: float, data_original: date, data_referencia: date, indice: str) -> dict:
     if data_original >= data_referencia:
         return {'sucesso': True, 'valor_corrigido': valor, 'fator_correcao': 1.0, 'variacao_percentual': 0.0, 'indices': [indice]}
     
-    dados = buscar_dados_indice(indice, data_original, data_referencia)
+    # Busca dados (Já filtra o período básico na busca)
+    # Pegamos uma margem de segurança nas datas para garantir que temos o mês inicial
+    dt_busca_ini = date(data_original.year, data_original.month, 1)
+    df = buscar_dados_indice(indice, dt_busca_ini, data_referencia)
     
-    if dados.empty:
-        return {'sucesso': False, 'mensagem': f'Sem dados para {indice}', 'valor_corrigido': valor}
+    if df.empty:
+        return {'sucesso': False, 'mensagem': f'Indisponível: {indice}', 'valor_corrigido': valor}
     
-    # Filtro de data exato (Mês Inicial -> Mês Anterior ao Final)
-    dt_inicio = date(data_original.year, data_original.month, 1)
-    dt_fim = date(data_referencia.year, data_referencia.month, 1)
-    mask = (dados['data'] >= dt_inicio) & (dados['data'] < dt_fim)
-    subset = dados.loc[mask]
+    # Lógica de Correção: Mês Inicial INCLUSO, Mês Final EXCLUSO (Padrão TJ)
+    dt_fim_corte = date(data_referencia.year, data_referencia.month, 1)
+    
+    mask = (df['data'] >= dt_busca_ini) & (df['data'] < dt_fim_corte)
+    subset = df.loc[mask]
     
     if subset.empty:
-        if dt_inicio == dt_fim:
+        # Se datas iguais (mesmo mês), correção é zero
+        if dt_busca_ini == dt_fim_corte:
              return {'sucesso': True, 'valor_corrigido': valor, 'fator_correcao': 1.0, 'variacao_percentual': 0.0}
-        return {'sucesso': False, 'mensagem': f'Período inválido', 'valor_corrigido': valor}
+        return {'sucesso': False, 'mensagem': 'Período sem dados', 'valor_corrigido': valor}
 
-    fator_correcao = (1 + subset['valor']).prod()
+    # Cálculo Acumulado
+    fator = (1 + subset['valor']).prod()
     
-    # Trava de segurança anti-explosão
-    if fator_correcao > 100:
-        return {'sucesso': False, 'mensagem': f'Erro de cálculo (Fator {fator_correcao:.2f})', 'valor_corrigido': valor}
-
-    valor_corrigido = valor * fator_correcao
+    # Trava de Sanidade (Se o fator for > 1000x, tem erro de dados)
+    if fator > 1000:
+        return {'sucesso': False, 'mensagem': 'Erro: Taxa explosiva detectada', 'valor_corrigido': valor}
+        
+    valor_corrigido = valor * fator
     
     return {
         'sucesso': True,
-        'valor_original': valor,
         'valor_corrigido': valor_corrigido,
-        'fator_correcao': fator_correcao,
-        'variacao_percentual': (fator_correcao - 1) * 100,
+        'fator_correcao': fator,
+        'variacao_percentual': (fator - 1) * 100,
         'indice': indice
     }
 
@@ -394,6 +307,7 @@ def calcular_correcao_media(valor: float, data_original: date, data_referencia: 
             
     if not fatores: return {'sucesso': False, 'mensagem': 'Falha nos índices'}
     
+    # Média Geométrica
     prod = math.prod(fatores)
     fator_medio = prod ** (1/len(fatores))
     
@@ -411,9 +325,7 @@ def formatar_moeda(valor: float) -> str:
 
 def limpar_cache():
     try:
-        if os.path.exists("indices_cache_v2.db"):
-            os.remove("indices_cache_v2.db")
-        cache._init_db()
+        if os.path.exists("indices_cache_v3.db"):
+            os.remove("indices_cache_v3.db")
         st.success("Cache limpo!")
-    except:
-        pass
+    except: pass
