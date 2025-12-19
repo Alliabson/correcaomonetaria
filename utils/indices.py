@@ -1,22 +1,27 @@
 import requests
 import sqlite3
 import pandas as pd
+import streamlit as st
 from datetime import date
 from dateutil.relativedelta import relativedelta
-from typing import List, Dict
+from typing import Dict, List
 
 DB_PATH = "indices_cache.db"
 
 INDICES_CONFIG = {
-    "IPCA": {"serie": 433, "fonte": "IBGE"},
-    "INPC": {"serie": 188, "fonte": "IBGE"},
-    "IGPM": {"serie": 189, "fonte": "FGV"},
-    "INCC": {"serie": 192, "fonte": "FGV"},
+    "IPCA": {"nome": "IPCA", "serie_bcb": 433},
+    "INPC": {"nome": "INPC", "serie_bcb": 188},
+    "INCC": {"nome": "INCC", "serie_bcb": 192},
 }
 
-# ======================
-# BANCO LOCAL
-# ======================
+MAX_MESES_CORRECAO = 60
+FATOR_ALERTA = 2.5
+FATOR_BLOQUEIO = 3.0
+
+
+# ==========================
+# BANCO
+# ==========================
 def _conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -27,7 +32,7 @@ def _init_db():
             CREATE TABLE IF NOT EXISTS indices (
                 indice TEXT,
                 data TEXT,
-                variacao REAL,
+                valor REAL,
                 PRIMARY KEY (indice, data)
             )
         """)
@@ -36,33 +41,44 @@ def _init_db():
 _init_db()
 
 
-def salvar(indice: str, data: str, variacao: float):
+def limpar_cache():
+    with _conn() as c:
+        c.execute("DELETE FROM indices")
+
+
+def salvar(indice, data, valor):
     with _conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO indices VALUES (?, ?, ?)",
-            (indice, data, variacao)
+            (indice, data, valor)
         )
 
 
-def buscar(indice: str, data: str):
+def buscar(indice, data):
     cur = _conn().cursor()
     cur.execute(
-        "SELECT variacao FROM indices WHERE indice = ? AND data = ?",
+        "SELECT valor FROM indices WHERE indice = ? AND data = ?",
         (indice, data)
     )
     r = cur.fetchone()
     return r[0] if r else None
 
 
-def limpar_cache():
-    with _conn() as c:
-        c.execute("DELETE FROM indices")
+# ==========================
+# AUXILIARES
+# ==========================
+def _ultimo_mes_fechado(data_ref: date) -> date:
+    return (data_ref.replace(day=1) - relativedelta(months=1))
 
 
-# ======================
-# API BACEN
-# ======================
-def _buscar_bacen(serie: int, inicio: date, fim: date) -> Dict[str, float]:
+def formatar_moeda(v):
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# ==========================
+# API
+# ==========================
+def _buscar_bcb(serie, inicio, fim):
     url = (
         f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie}/dados"
         f"?formato=json"
@@ -73,24 +89,16 @@ def _buscar_bacen(serie: int, inicio: date, fim: date) -> Dict[str, float]:
     r.raise_for_status()
 
     dados = {}
-    for item in r.json():
-        data_ref = pd.to_datetime(item["data"], dayfirst=True).strftime("%Y-%m-01")
-        variacao = float(item["valor"].replace(",", "."))
-        dados[data_ref] = variacao
-
+    for i in r.json():
+        data = pd.to_datetime(i["data"], dayfirst=True).strftime("%Y-%m-01")
+        dados[data] = float(i["valor"].replace(",", "."))
     return dados
 
 
-# ======================
-# OBTÉM ÚLTIMOS 12 MESES
-# ======================
-def _ultimos_12_meses(data_ref: date):
-    fim = data_ref.replace(day=1) - relativedelta(months=1)
-    inicio = fim - relativedelta(months=11)
-    return inicio, fim
-
-
-def _variacoes_periodo(indice: str, inicio: date, fim: date) -> Dict[str, float]:
+# ==========================
+# CORE
+# ==========================
+def _indices_periodo(indice, inicio, fim):
     meses = pd.date_range(inicio, fim, freq="MS")
     valores = {}
 
@@ -103,65 +111,68 @@ def _variacoes_periodo(indice: str, inicio: date, fim: date) -> Dict[str, float]
     faltantes = [d for d in meses if d.strftime("%Y-%m-01") not in valores]
 
     if faltantes:
-        api = _buscar_bacen(
-            INDICES_CONFIG[indice]["serie"],
+        dados_api = _buscar_bcb(
+            INDICES_CONFIG[indice]["serie_bcb"],
             faltantes[0].date(),
             faltantes[-1].date()
         )
-        for k, v in api.items():
+        for k, v in dados_api.items():
             salvar(indice, k, v)
             valores[k] = v
 
     return valores
 
 
-# ======================
-# CÁLCULO INDIVIDUAL
-# ======================
-def calcular_correcao_individual(
-    valor: float,
-    data_referencia: date,
-    indice: str
-) -> Dict:
+def calcular_correcao_individual(valor, data_ini, data_ref, indice):
+    fim = _ultimo_mes_fechado(data_ref)
+    inicio = data_ini.replace(day=1)
 
-    inicio, fim = _ultimos_12_meses(data_referencia)
-    variacoes = _variacoes_periodo(indice, inicio, fim)
+    meses = (fim.year - inicio.year) * 12 + (fim.month - inicio.month)
+
+    if meses <= 0:
+        return {"sucesso": False, "mensagem": "Período inválido"}
+
+    if meses > MAX_MESES_CORRECAO:
+        return {"sucesso": False, "mensagem": "Período excede limite técnico"}
+
+    indices = _indices_periodo(indice, inicio, fim)
 
     fator = 1.0
-    for v in variacoes.values():
+    for v in indices.values():
         fator *= (1 + v / 100)
+
+    if fator > FATOR_BLOQUEIO:
+        return {"sucesso": False, "mensagem": "Correção excessiva bloqueada"}
+
+    valor_corrigido = valor * fator
+    variacao = (fator - 1) * 100
 
     return {
         "sucesso": True,
-        "valor_corrigido": valor * fator,
+        "valor_corrigido": valor_corrigido,
         "fator_correcao": fator,
-        "variacao_percentual": (fator - 1) * 100,
+        "variacao_percentual": variacao,
         "indice": indice
     }
 
 
-# ======================
-# CÁLCULO MÉDIA ARITMÉTICA MENSAL
-# ======================
-def calcular_correcao_media(
-    valor: float,
-    data_referencia: date,
-    indices: List[str]
-) -> Dict:
+def calcular_correcao_media(valor, data_ini, data_ref, indices: List[str]):
+    fim = _ultimo_mes_fechado(data_ref)
+    inicio = data_ini.replace(day=1)
 
-    inicio, fim = _ultimos_12_meses(data_referencia)
+    fatores_mensais = []
 
-    series = []
     for ind in indices:
-        series.append(
-            _variacoes_periodo(ind, inicio, fim)
-        )
+        dados = _indices_periodo(ind, inicio, fim)
+        fatores_mensais.append(list(dados.values()))
 
     fator_final = 1.0
-
-    for mes in series[0].keys():
-        media_mes = sum(s[mes] for s in series) / len(series)
+    for i in range(len(fatores_mensais[0])):
+        media_mes = sum(f[i] for f in fatores_mensais) / len(fatores_mensais)
         fator_final *= (1 + media_mes / 100)
+
+    if fator_final > FATOR_BLOQUEIO:
+        return {"sucesso": False, "mensagem": "Correção excessiva bloqueada"}
 
     return {
         "sucesso": True,
