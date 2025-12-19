@@ -204,12 +204,15 @@ def render_sidebar():
     """Renderiza a barra lateral com configurações"""
     st.sidebar.header("Configurações de Correção")
     
-    # Botão para limpar cache
+# Botão para limpar cache
     if st.sidebar.button("🗑️ Limpar Cache", help="Limpa dados em cache para forçar atualização"):
-        limpar_cache() # Limpa o cache do SQLite
-        # ===== INÍCIO DA CORREÇÃO =====
-        get_indices_disponiveis.clear() # Limpa o cache do Streamlit (@st.cache_data)
-        # ===== FIM DA CORREÇÃO =====
+        # Removemos a chamada antiga 'limpar_cache()' pois o SQLite não existe mais.
+        
+        # Comando oficial do Streamlit para limpar TODO o cache de dados (@st.cache_data)
+        st.cache_data.clear()
+        
+        st.success("Cache atualizado com sucesso!")
+        time.sleep(1) # Dá um tempinho para o usuário ler a mensagem (opcional)
         st.rerun()
     
     # Verificar índices disponíveis
