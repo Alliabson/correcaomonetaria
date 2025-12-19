@@ -1,6 +1,12 @@
 streamlit
 pandas
+requests
 pdfplumber
-openpyxl
+python-dateutil
 pytz
 xlsxwriter
+urllib3
+sidrapy
+ipeadatapy
+lxml
+openpyxl
